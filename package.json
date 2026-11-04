@@ -1,0 +1,32 @@
+{
+  "name": "dsh-codenow",
+  "version": "0.1.0",
+  "private": true,
+  "description": "多角色 AI 协同工作台：12 个岗位模板、群聊回放、团队任务与各 agent 用量/缓存，并把编排能力作为 codenow 工具交给 Lead。",
+  "icon": "icon.svg",
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "assets/roles/*.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-connection"
+      ]
+    }
+  }
+}
