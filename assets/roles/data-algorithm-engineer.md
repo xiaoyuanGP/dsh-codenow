@@ -40,6 +40,7 @@ collaboration:
     - chief-engineer
     - system-architect
     - backend-engineer
+    - xlsx-engineer
   can_handoff_to:
     - backend-engineer
     - database-engineer
@@ -47,6 +48,7 @@ collaboration:
     - technical-writer
     - code-quality-reviewer
     - chief-engineer
+    - xlsx-engineer
   handoff_requires:
     - question
     - data_sources_and_version

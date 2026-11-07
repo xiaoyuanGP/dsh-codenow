@@ -39,6 +39,7 @@ collaboration:
     - system-architect
     - test-engineer
   can_handoff_to:
+    - modeling-engineer
     - test-engineer
     - code-quality-reviewer
     - backend-engineer
@@ -46,6 +47,7 @@ collaboration:
     - chief-engineer
     - mobile-client-engineer
     - technical-writer
+    - pptx-engineer
   handoff_requires:
     - objective
     - changed_files

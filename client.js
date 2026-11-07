@@ -11,6 +11,29 @@ window.__ModuleLoader__.load({
     const h = React.createElement
     const { useCallback, useEffect, useRef, useState } = React
 
+    /**
+     * 把浮层挂到 document.body。
+     *
+     * 会话头部插槽渲染在宿主的 .an3WzG_titleRow 里，那一行带
+     * `container-type: inline-size`（等价于 `contain: layout style inline-size`）——
+     * 布局 containment 会让它成为内部 `position: fixed` 后代的包含块，并切出独立层叠上下文。
+     * 于是 `inset: 0` 只等于那条 30px 高的标题行，弹层被压成窄缝、还会被后绘制的消息区盖住。
+     * 挂到 body 才拿得到真正的视口。
+     *
+     * react-dom 取不到时原样返回节点，退化成旧的内联渲染（不抛错、不白屏）。
+     */
+    const portalIntoBody = (() => {
+      if (typeof document === 'undefined' || document.body === null) return (node) => node
+      let createPortal = null
+      try {
+        const reactDom = require('react-dom')
+        createPortal = typeof reactDom?.createPortal === 'function' ? reactDom.createPortal : null
+      } catch {
+        createPortal = null
+      }
+      return createPortal === null ? (node) => node : (node) => createPortal(node, document.body)
+    })()
+
     /** Connection-service sender installed by apply(); null when unavailable. */
     let viaConnection = null
 
@@ -141,6 +164,20 @@ window.__ModuleLoader__.load({
         border: `1px solid ${EDGE}`,
         color: MUTED,
       },
+      envBar: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 10, padding: '0 24px 10px', fontSize: 11.5, color: MUTED },
+      envItem: { display: 'inline-flex', alignItems: 'center', gap: 4 },
+      envMissing: { color: 'var(--dsw-alias-label-error, #c0392b)' },
+      envBtn: {
+        appearance: 'none',
+        border: `1px solid ${EDGE}`,
+        background: 'transparent',
+        color: 'inherit',
+        borderRadius: 6,
+        padding: '2px 8px',
+        fontSize: 11,
+        cursor: 'pointer',
+        fontFamily: 'inherit',
+      },
     }
 
     const TABS = [
@@ -205,6 +242,37 @@ window.__ModuleLoader__.load({
       if (status === 'in_progress') return '进行中'
       if (status === 'pending') return '待办'
       return status || '-'
+    }
+
+    // 任务「卡在谁身上」的标签。Host 没算 stage（旧版本、或首个请求还没带）时返回空串，不占格子。
+    const STAGE_TEXT = {
+      review: '等你验收',
+      blocked: '等上游',
+      queued: '未开始',
+      working: '进行中',
+      stalled: '疑似停摆',
+      unknown: '未知',
+    }
+
+    function stageText(task) {
+      const stage = String(task?.stage ?? '')
+      if (!stage) return ''
+      const text = STAGE_TEXT[stage] ?? stage
+      // 停摆是结构化启发式推出来的，不是事实，标出来免得被当成结论。
+      return stage === 'stalled' ? `${text}（推测）` : text
+    }
+
+    // 等你验收的排最前：这一栏存在的意义就是回答「现在需要我做什么」。
+    const STAGE_RANK = { review: 0, stalled: 1, blocked: 2, working: 3, queued: 4, unknown: 5 }
+
+    function orderedTasks(tasks) {
+      return tasks.slice().sort((a, b) => (STAGE_RANK[a?.stage] ?? 9) - (STAGE_RANK[b?.stage] ?? 9))
+    }
+
+    // 有人要处理时才把数字顶到标题上；没人要处理就不打扰。
+    function tasksTitle(tasks) {
+      const waiting = tasks.filter((task) => task?.stage === 'review').length
+      return waiting > 0 ? `团队任务（${tasks.length}，等你处理 ${waiting}）` : `团队任务（${tasks.length}）`
     }
 
     // <option> 用系统色：它会跟着下面设的 color-scheme 自动取深/浅调色板，且不透明，
@@ -440,7 +508,7 @@ window.__ModuleLoader__.load({
         { style: { position: 'relative', display: 'inline-flex', alignItems: 'center', gap: 6, marginLeft: 4 } },
         chips,
         open
-          ? h(
+          ? portalIntoBody(h(
               'div',
               {
                 style: { position: 'fixed', inset: 0, zIndex: 9998, background: 'var(--dsw-alias-bg-mask-1, rgba(0,0,0,0.35))' },
@@ -520,6 +588,7 @@ window.__ModuleLoader__.load({
                     )
               )
             )
+          )
           : null
       )
     }
@@ -902,15 +971,15 @@ window.__ModuleLoader__.load({
           ? h(
               'div',
               null,
-              h('div', { style: { ...S.cardTitle, marginBottom: 6 } }, `团队任务（${data.tasks.length}）`),
+              h('div', { style: { ...S.cardTitle, marginBottom: 6 } }, tasksTitle(data.tasks)),
               h(
                 'table',
                 { style: S.table },
-                h('thead', null, h('tr', null, ['任务', '状态', '上游', '创建时间'].map((t) => h('th', { key: t, style: S.th }, t)))),
+                h('thead', null, h('tr', null, ['任务', '状态', '归属', '上游', '创建时间'].map((t) => h('th', { key: t, style: S.th }, t)))),
                 h(
                   'tbody',
                   null,
-                  data.tasks.map((task, index) =>
+                  orderedTasks(data.tasks).map((task, index) =>
                     h(
                       'tr',
                       { key: `${task.seq}-${index}` },
@@ -924,6 +993,11 @@ window.__ModuleLoader__.load({
                         'td',
                         { style: { ...S.td, ...S.num, opacity: task.status === 'completed' ? 0.55 : 1 } },
                         statusText(task.status)
+                      ),
+                      h(
+                        'td',
+                        { style: { ...S.td, ...S.num, fontWeight: task.stage === 'review' ? 600 : 400 } },
+                        stageText(task) || '-'
                       ),
                       h('td', { style: { ...S.td, ...S.num } }, Array.isArray(task.blockedBy) && task.blockedBy.length ? task.blockedBy.join(', ') : '-'),
                       h('td', { style: { ...S.td, ...S.num } }, fmtTime(task.at))
@@ -1208,9 +1282,48 @@ window.__ModuleLoader__.load({
         })
       }, [])
 
+      // 环境：只读检测 + 用户点一次才装。装完立刻重读状态，不做乐观更新（避免界面说装好了其实没装）。
+      const [env, setEnv] = useState(null)
+      const [envBusy, setEnvBusy] = useState('')
+      const [envNote, setEnvNote] = useState('')
+
+      const loadEnv = useCallback(() => {
+        return callRpc('setup', {})
+          .then((result) => {
+            if (result?.ok) setEnv(result.value ?? null)
+            else setEnvNote(result?.error?.message ?? '环境检测失败')
+          })
+          .catch((err) => {
+            setEnvNote(String(err?.message ?? err) || '环境检测失败')
+          })
+      }, [])
+
+      const install = useCallback(
+        (target) => {
+          setEnvBusy(target)
+          setEnvNote('')
+          callRpc('install', { target })
+            .then((result) => {
+              setEnvBusy('')
+              if (result?.ok) {
+                setEnvNote(target === 'mcp' ? '已注册 MCP，重启 DSH 后生效' : '已装 Blender addon')
+                loadEnv()
+              } else {
+                setEnvNote(result?.error?.message ?? '安装失败')
+              }
+            })
+            .catch((err) => {
+              setEnvBusy('')
+              setEnvNote(String(err?.message ?? err) || '安装失败')
+            })
+        },
+        [loadEnv]
+      )
+
       useEffect(() => {
         refresh()
-      }, [refresh])
+        loadEnv()
+      }, [refresh, loadEnv])
 
       // 只是一次条件分派：元素每次 render 都会重建，套记忆化没有收益。
       let content = h(TeamTab, { state })
@@ -1240,6 +1353,67 @@ window.__ModuleLoader__.load({
           h('div', { style: S.spacer }),
           h('button', { style: S.btn, onClick: refresh, disabled: loading, 'aria-busy': loading }, loading ? '刷新中…' : '刷新')
         ),
+        h(
+          'div',
+          { style: S.envBar },
+          h('span', null, '环境'),
+          ...(env
+            ? [
+                (() => {
+                  const rows = env.skills?.items ?? []
+                  const skillsOk = rows.length > 0 && rows.every((row) => row.installed)
+                  return h('span', { key: 'skills', style: skillsOk ? S.envItem : { ...S.envItem, ...S.envMissing } }, `技能 ${skillsOk ? '已内置' : '缺失'}`)
+                })(),
+                h('span', { key: 'mcp', style: env.mcp?.registered ? S.envItem : { ...S.envItem, ...S.envMissing } }, `MCP ${env.mcp?.registered ? '已注册' : '未注册'}`),
+                (() => {
+                  const addons = env.blender?.addons ?? []
+                  return h('span', { key: 'addon', style: addons.length > 0 ? S.envItem : { ...S.envItem, ...S.envMissing } }, `Blender addon ${addons.length > 0 ? addons.join(' / ') : '未装'}`)
+                })(),
+              ]
+            : [h('span', { key: 'loading', style: S.envItem }, envNote || '检测中…')]),
+          env && envNote ? h('span', { style: S.envMissing }, envNote) : null,
+          h(
+            'button',
+            {
+              style: { ...S.envBtn, opacity: envBusy !== '' || env?.mcp?.registered === true ? 0.5 : 1, cursor: envBusy !== '' || env?.mcp?.registered === true ? 'default' : 'pointer' },
+              onClick: () => install('mcp'),
+              disabled: envBusy !== '' || env?.mcp?.registered === true,
+            },
+            envBusy === 'mcp' ? '注册中…' : '装 MCP'
+          ),
+          h(
+            'button',
+            {
+              style: { ...S.envBtn, opacity: envBusy !== '' || (env?.blender?.addons?.length ?? 0) > 0 ? 0.5 : 1, cursor: envBusy !== '' || (env?.blender?.addons?.length ?? 0) > 0 ? 'default' : 'pointer' },
+              onClick: () => install('addon'),
+              disabled: envBusy !== '' || (env?.blender?.addons?.length ?? 0) > 0,
+            },
+            envBusy === 'addon' ? '安装中…' : '装 Blender addon'
+          )
+        ),
+        (() => {
+          // 项目级状态：只有真需要用户动作时才高亮，内部复核/进行中不打扰用户。
+          const auto = state?.autonomy
+          if (!auto || (!auto.project && !auto.stopped)) return null
+          const project = auto.project
+          const tasks = project?.tasks ?? []
+          const open = (project?.questions ?? []).filter((row) => !row.answeredAt)
+          const review = tasks.filter((row) => row.verification?.verdict === 'pass')
+          const working = tasks.filter((row) => row.status === 'in_progress')
+          const head = auto.stopped
+            ? `自动接续已停止（${auto.stopped.reason || '无原因'}）· 需要用户明确说恢复`
+            : `目标：${project.objective}`
+          const tail = project
+            ? [
+                `任务 ${tasks.length}（进行中 ${working.length} / 待复核 ${review.length}）`,
+                open.length > 0 ? `需要你处理 ${open.length} 项：${open[0].question}` : '',
+                project.nextAction ? `下一步：${project.nextAction}` : '',
+              ]
+                .filter(Boolean)
+                .join(' · ')
+            : ''
+          return h('div', { style: open.length > 0 || auto.stopped ? { ...S.envBar, ...S.envMissing } : S.envBar }, head, tail ? h('span', null, tail) : null)
+        })(),
         h(
           'div',
           { style: S.tabs, role: 'tablist' },

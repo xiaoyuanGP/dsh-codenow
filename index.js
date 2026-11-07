@@ -1,16 +1,35 @@
 /**
  * dsh-codenow — 多角色 AI 协同工作台（Host half）。
  *
- * 把 Origin CodeNow 的组织法接进 dsh：12 个岗位模板（1 首席 + 11 专家），
+ * 把 Origin CodeNow 的组织法接进 dsh：17 个岗位模板（1 首席 + 16 专家），
  * 并把 dsh 自己已有的运行数据（会话、团队动作、各 agent 用量与缓存）
  * 汇总成一个只读视图 + 一个供 Lead 编排用的 `codenow` 工具。
  *
  * 全部只读：不改会话、不写账本、不伪造数据；缺失就返回空并说明来源。
  */
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, renameSync, rmSync, statSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { appendFileSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
+import { homedir, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import {
+  AUTONOMY_VERSION,
+  addQuestion,
+  clearStop,
+  currentProject,
+  decideContinuation,
+  emptyState,
+  noteFor,
+  openProject,
+  projectView,
+  readState,
+  recordVerification,
+  rememberDelivery,
+  setStop,
+  stageOfTask,
+  upsertTask,
+  writeState,
+} from './lib/autonomy.js'
 import { zstdDecompressSync } from 'node:zlib'
 
 export const name = 'codenow'
@@ -43,7 +62,7 @@ function trace(line) {
 
 // 直接 `node index.js` 跑自检时不写这行：诊断日志只该记宿主的真实加载。
 // invokedDirectly 是函数声明，会提升，这里可以直接用。
-if (!invokedDirectly()) trace(`module evaluated from ${HERE} [12-roles]`)
+if (!invokedDirectly()) trace(`module evaluated from ${HERE}`)
 
 /** 岗位 MD：取 frontmatter 标量 + can_handoff_to，正文原样保留。 */
 function parseRole(file) {
@@ -712,6 +731,42 @@ const COORDINATION_TOOLS =
   /^(team_task_create|team_task_get|team_task_update|team_task_list|spawn_teammate|send_message|wait_agent|list_agents)$/
 
 /**
+ * 任务「现在卡在谁身上」。只吃结构化字段：宿主 `team/task` 的 status / blockedBy / 事件时间，
+ * 外加全局活跃成员数——**不碰消息文本**，签名也只有 (task, ctx) 两个参数。
+ * 宿主不给「等人回答」「投递失败」这两个信号，那两种如实返回 unknown，不猜。
+ */
+function taskStageOf(task, ctx) {
+  const status = String(task?.status ?? '')
+  const blocked = Array.isArray(task?.blockedBy) && task.blockedBy.length > 0
+  const liveCount = ctx?.liveCount ?? null
+  const stallMs = Number(ctx?.stallMs ?? 0)
+  const now = Number(ctx?.now ?? Date.now())
+  const at = Number(task?.at ?? 0)
+  if (status === 'completed') return { stage: 'review', waitingOn: 'person' }
+  if (blocked) return { stage: 'blocked', waitingOn: 'agent' }
+  if (status === 'pending') return { stage: 'queued', waitingOn: 'none' }
+  if (status === 'in_progress') {
+    // liveCount 为 null 表示 registry 拿不到：这种情况下不判停摆，宁可 working。
+    const stalled = liveCount === 0 && stallMs > 0 && at > 0 && now - at > stallMs
+    if (stalled) return { stage: 'stalled', waitingOn: 'unknown' }
+    return { stage: 'working', waitingOn: 'agent' }
+  }
+  return { stage: 'unknown', waitingOn: 'unknown' }
+}
+
+/** 把 stage 叠到任务行上。stage 与时间、活跃成员数有关，所以不进协调缓存，每次请求现算。 */
+function tasksWithStage(value, ctx) {
+  const tasks = Array.isArray(value?.tasks) ? value.tasks : []
+  return { ...value, tasks: tasks.map((task) => ({ ...task, ...taskStageOf(task, ctx) })) }
+}
+
+/** 停摆判定要用的全局事实：活跃成员数（拿不到就是 null）、当前时间、静默窗口。 */
+function stageContext() {
+  const liveIds = listLiveIds()
+  return { liveCount: liveIds ? liveIds.size : null, now: Date.now(), stallMs: STALL_MS }
+}
+
+/**
  * 任务：dsh 的任务板不在磁盘上，按会话日志里的团队动作如实重建。
  * `team/task` 是权威快照（带 status / revision，同一 task 会多次出现，取最大 revision），
  * 有它就以它为准；早期会话没有该事件时才退回用 `team_task_create` 的入参推断——推断出来的没有状态。
@@ -876,6 +931,11 @@ function statePayload() {
     sessionsTotal: sessions.length,
     byProviderModel: usage.byProviderModel,
     sessions: sessions.slice(0, 40).map(sessionRow(usage)),
+    // 新增（兼容：原有字段一个没动）：项目级自主状态，面板据此区分内部处理与需要用户。
+    autonomy: (() => {
+      const info = readProjectState()
+      return projectView(info.state, { problem: info.problem })
+    })(),
   }
 }
 
@@ -961,6 +1021,12 @@ async function answer(args) {
     }
     case 'role':
       return roleText(String(args?.id ?? ''))
+    case 'setup':
+      // 只读：告诉调用方 blender 能力装没装、缺什么。装的动作留给面板按钮（用户点一次才算数）。
+      return JSON.stringify(setupStatus(), null, 2)
+    case 'project':
+      // 项目状态：目标、验收、任务、复核、待用户问题与下一步。写操作也走这里。
+      return projectOp(args?.project ?? args)
     default:
       return `未知 action：${action}（可用：roles / role）`
   }
@@ -968,14 +1034,14 @@ async function answer(args) {
 
 const TOOL_DEFINITION = {
   name: 'codenow',
-  description: '列出 12 个岗位模板，或取某岗位完整规范全文（可直接作为 spawn_teammate 的 prompt）。只读，不建团队。',
+  description: '列出 17 个岗位模板，或取某岗位完整规范全文（可直接作为 spawn_teammate 的 prompt）。只读，不建团队。',
   parameters: {
     type: 'object',
     properties: {
       action: {
         type: 'string',
-        enum: ['roles', 'role'],
-        description: 'roles 列岗位；role 取某岗位的完整规范全文。',
+        enum: ['roles', 'role', 'setup', 'project'],
+        description: 'roles 列岗位；role 取岗位规范全文；setup 查 Blender 能力（只读）；project 读写项目状态。',
       },
       id: { type: 'string', description: '岗位 id（action=role）。' },
     },
@@ -1110,6 +1176,15 @@ const SWEEP_INTERVAL_MS = 3 * 60 * 1000
 const SWEEP_GRACE_MS = 10 * 60 * 1000
 // 首次 sweep 等 10 分钟：插件刚加载时会话可能正被宿主接续，早扫没有收益只有风险。
 const FIRST_SWEEP_DELAY_MS = 10 * 60 * 1000
+
+/** 「推测停摆」的静默窗口：全局没有活跃成员、任务又超过这么久没动，才敢这么标。 */
+const STALL_MS = 10 * 60 * 1000
+
+/**
+ * 搬目录时能靠「下一轮」解决的错误码：宿主可能正开着会话文件，锁一松开就好了。
+ * 不在这个集合里的一律当失败记录，免得把真问题说成「稍后重试」。
+ */
+const RETRYABLE_SWEEP_CODES = new Set(['EBUSY', 'EPERM', 'EACCES', 'ENOTEMPTY'])
 // 只有 turn/end 能证明「这一轮真结束了」。session/end-seed 名字像收尾，实际是生命周期**起点**：
 // 宿主在建会话、继承和恢复会话时都会写它（事件定义里带 inherited?: true），本机 90 个会话中有 28 个
 // 出现在日志中段、还有会话出现过 2 次 —— 它不能证明任务完成，所以不在白名单里。
@@ -1272,7 +1347,13 @@ function applySweep(plan, now = Date.now()) {
       moved += 1
       trace(`sweep moved ${candidate.id} ${candidate.bytes}B ${candidate.dir} -> ${target}`)
     } catch (error) {
-      trace(`sweep move FAILED ${candidate.id} ${candidate.dir} -> ${target}: ${errorMessage(error)}`)
+      const code = String(error?.code ?? '')
+      if (RETRYABLE_SWEEP_CODES.has(code)) {
+        // 宿主可能正开着这些文件。搬不动不算失败：下一个 180 秒周期会自动重试。
+        trace(`sweep defer ${candidate.id} ${code}（下一轮重试）`)
+      } else {
+        trace(`sweep move FAILED ${candidate.id} ${candidate.dir} -> ${target}: ${errorMessage(error)}`)
+      }
     }
   }
   if (moved > 0) {
@@ -1453,11 +1534,11 @@ function livePayload(sessionId) {
 const CODENOW_POLICY = [
   '## 多 AI 协同（强制，按任务裁剪）',
   '',
-  '本会话搭载 codenow 岗位矩阵：你 + 11 位专家工程师。**你是 Lead 时**你就是首席工程师，对技术决策和交付闭环负责；新任务开始时先用 `codenow({action:"role",id:"chief-engineer"})` 读取首席岗位全文，同一任务复用已读内容、模板变化后重新读取。岗位规范不能覆盖用户要求或宿主审批。',
+  '本会话搭载 codenow 岗位矩阵：你 + 16 位专家工程师。**你是 Lead 时**你就是首席工程师，对技术决策和交付闭环负责；新任务开始时先用 `codenow({action:"role",id:"chief-engineer"})` 读取首席岗位全文，同一任务复用已读内容、模板变化后重新读取。岗位规范不能覆盖用户要求或宿主审批。',
   '',
-  '**派活**：先判断这活该谁做——小改动、单文件、纯查询可以自己做完并写明理由；涉及跨领域、需要独立验证或独立视角时派给对应岗位。**允许零个 teammate**，决定派人之后再按规模选人数：默认 1 个、跨领域 2 个、最多 3 个；禁止把 11 个依次拉起，禁止为「显得在协同」而全量 spawn。用户本轮明说「不用子智能体」「你自己做」「别派人」时遵从用户并写明理由。说派了却没有真实调用＝假报进度；子智能体在跑时不要自己重复做它的活。',
+  '**派活**：先判断这活该谁做——小改动、单文件、纯查询可以自己做完并写明理由；涉及跨领域、需要独立验证或独立视角时派给对应岗位。**允许零个 teammate**，决定派人之后再按规模选人数：默认 1 个、跨领域 2 个、最多 3 个；禁止把 16 个依次拉起，禁止为「显得在协同」而全量 spawn。用户本轮明说「不用子智能体」「你自己做」「别派人」时遵从用户并写明理由。说派了却没有真实调用＝假报进度；子智能体在跑时不要自己重复做它的活。',
   '',
-  '路由：UI/样式/交互/a11y→`frontend-design-engineer`；服务端/接口/业务/异步→`backend-engineer`；移动端/跨端→`mobile-client-engineer`；表结构/索引/迁移→`database-engineer`；数据清洗/指标/算法→`data-algorithm-engineer`；测试/缺陷复现→`test-engineer`；代码审查/质量门禁→`code-quality-reviewer`；构建/部署/环境→`devops-sre-engineer`；鉴权/加密/依赖漏洞→`security-engineer`；架构/模块边界/选型→`system-architect`；文档/README→`technical-writer`。',
+  '路由：UI/样式/交互/a11y→`frontend-design-engineer`；服务端/接口/业务/异步→`backend-engineer`；移动端/跨端→`mobile-client-engineer`；表结构/索引/迁移→`database-engineer`；数据清洗/指标/算法→`data-algorithm-engineer`；测试/缺陷复现→`test-engineer`；代码审查/质量门禁→`code-quality-reviewer`；构建/部署/环境→`devops-sre-engineer`；鉴权/加密/依赖漏洞→`security-engineer`；架构/模块边界/选型→`system-architect`；文档/README→`technical-writer`；PPT/演示/汇报材料→`pptx-engineer`；Word 长文档/样式与模板→`docx-engineer`；Excel/表格/数据透视→`xlsx-engineer`；GitHub 仓库/开源协作/发布→`github-repo-manager`；Blender 建模/3D 资产/引擎导出→`modeling-engineer`。',
   '',
   '**断线必须恢复**：子智能体断掉（工具连错、send_message 被拒、wait_agent 无进展、会话报错、从名册消失）不许丢活：① 先 `send_message` 唤醒；② 唤不醒或已不在名册，才新建一个——用新的唯一 name（同岗位第二次起 `<role-id>-2`、`-3`…），把已完成部分与原任务一起写进 prompt；同队 name 终身不可复用，累计创建上限以宿主实际配置为准，停止成员不代表释放名额；③ 同岗位连败 2 次，换邻岗或自己做完，并在汇总写明。派活时交代「做到哪步、产出放哪」。',
   '',
@@ -1468,6 +1549,8 @@ const CODENOW_POLICY = [
   '**你是子智能体时**：只做本职，不再拉人；跨岗位决策找 Lead。',
   '',
   '**语言**：你用简体中文思考和回答用户；子智能体一律用英文（其系统提示词里已内置该要求），派工 prompt 末尾仍附一行 `Reply in English.` 作为兜底。',
+  '',
+  '**自主推进（项目级）**：用户给一次明确需求后，调查→计划→分派→复核→返工→集成由你连续做完，不要用「要不要继续」「是否执行下一批」结束，也不要让用户逐项点头。用 `codenow({action:"project"})` 记录：`open`（目标+验收+范围）、`task`（任务/归属/依赖）、`verify`（复核结论，必须由非 owner 给出）、`ask`（真缺业务定义才记，合并成一次）、`next`（下一步）、`deliver`（验收齐了才交付）、`stop`/`resume`。子智能体交回结果时你会被自动接回：先核对磁盘产物与复核记录再决定，不重复已完成的写操作。**叫停后必须等用户明确恢复**，不得自行 restart。普通技术取舍你自己裁决并写依据；自证不算独立复核。',
 ].join('\n')
 
 /**
@@ -1521,11 +1604,353 @@ function chatValue(pool, limit, total) {
   }
 }
 
+// ---- 内置资源：技能 / MCP 桥 / Blender addon ------------------------------------
+// 目标：别人装了插件就有 Blender 能力，不用自己去 clone 技能、不用装 Python 包。
+// 技能与桥在插件包里，addon 也在包里；写用户目录只有两处（技能目录、Blender addon 目录），
+// 都走幂等 + 显式触发，装了什么写在返回值里，不靠"没报错"猜。
+const BUNDLED_SKILLS = join(HERE, 'assets', 'skills')
+const BUNDLED_ADDON = join(HERE, 'assets', 'blender-addon', 'blender_mcp_addon')
+const BRIDGE_FILE = join(HERE, 'bin', 'blender-mcp-server.mjs')
+const SKILLS_ROOT = join(DSH_HOME, 'skills')
+const SKILL_MANIFEST = join(SKILLS_ROOT, '.codenow-skills.json')
+const MCP_CONFIG = join(DSH_HOME, 'mcp-manager.json')
+const MCP_SERVER_NAME = 'codenow-blender'
+
+function hashFile(file) {
+  try {
+    return createHash('sha256').update(readFileSync(file)).digest('hex').slice(0, 16)
+  } catch {
+    return ''
+  }
+}
+
+function listDirs(root) {
+  try {
+    return readdirSync(root, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name)
+  } catch {
+    return []
+  }
+}
+
+function readJsonFile(file) {
+  try {
+    return JSON.parse(readFileSync(file, 'utf8'))
+  } catch {
+    return null
+  }
+}
+
+function writeJsonFile(file, value) {
+  mkdirSync(dirname(file), { recursive: true })
+  writeFileSync(file, JSON.stringify(value, null, 2) + '\n')
+}
+
+function copyTree(from, to) {
+  mkdirSync(to, { recursive: true })
+  for (const entry of readdirSync(from, { withFileTypes: true })) {
+    const src = join(from, entry.name)
+    const dest = join(to, entry.name)
+    if (entry.isDirectory()) copyTree(src, dest)
+    else if (entry.isFile()) copyFileSync(src, dest)
+  }
+}
+
+// 技能内容用 SKILL.md 的哈希判断版本：技能真正的正文就是它，改了就重装一次。
+function bundledSkills() {
+  return listDirs(BUNDLED_SKILLS)
+    .map((name) => ({ name, src: join(BUNDLED_SKILLS, name), hash: hashFile(join(BUNDLED_SKILLS, name, 'SKILL.md')) }))
+    .filter((skill) => skill.hash !== '')
+}
+
+function installBundledSkills() {
+  const skills = bundledSkills()
+  if (skills.length === 0) return { installed: [], skipped: [], reason: '插件包里没有内置技能' }
+  const manifest = readJsonFile(SKILL_MANIFEST) ?? { version: 1, skills: {} }
+  const installed = []
+  const skipped = []
+  for (const skill of skills) {
+    const dest = join(SKILLS_ROOT, skill.name)
+    const upToDate = manifest.skills?.[skill.name]?.hash === skill.hash && existsSync(join(dest, 'SKILL.md'))
+    if (upToDate) {
+      skipped.push(skill.name)
+      continue
+    }
+    copyTree(skill.src, dest)
+    manifest.skills = { ...(manifest.skills ?? {}), [skill.name]: { hash: skill.hash, at: new Date().toISOString() } }
+    installed.push(skill.name)
+  }
+  if (installed.length > 0) writeJsonFile(SKILL_MANIFEST, manifest)
+  return { installed, skipped }
+}
+
+// Blender 各版本的 addon 目录：只探测存在 blender_mcp_addon 的那些，没装过的不瞎猜。
+function blenderAddonDirs() {
+  const base = process.env.APPDATA ? join(process.env.APPDATA, 'Blender Foundation', 'Blender') : ''
+  if (base === '') return []
+  return listDirs(base)
+    .map((version) => ({ version, dir: join(base, version, 'scripts', 'addons', 'blender_mcp_addon') }))
+    .filter((row) => existsSync(join(row.dir, '__init__.py')))
+}
+
+function blenderVersions() {
+  const base = process.env.APPDATA ? join(process.env.APPDATA, 'Blender Foundation', 'Blender') : ''
+  return base === '' ? [] : listDirs(base)
+}
+
+function mcpEntry() {
+  const config = readJsonFile(MCP_CONFIG)
+  const servers = config?.servers
+  if (!Array.isArray(servers)) return null
+  return servers.find((row) => row?.serverName === MCP_SERVER_NAME) ?? null
+}
+
+// 只读：告诉面板"缺什么"，不改任何东西（Q3：装不装由用户点）。
+function setupStatus() {
+  const entry = mcpEntry()
+  return {
+    skills: {
+      root: SKILLS_ROOT,
+      items: bundledSkills().map((skill) => ({
+        name: skill.name,
+        installed: existsSync(join(SKILLS_ROOT, skill.name, 'SKILL.md')),
+      })),
+    },
+    mcp: {
+      name: MCP_SERVER_NAME,
+      bridge: existsSync(BRIDGE_FILE),
+      registered: Boolean(entry),
+      enabled: entry?.enabled === true,
+    },
+    blender: {
+      versions: blenderVersions(),
+      addons: blenderAddonDirs().map((row) => row.version),
+      bundled: existsSync(join(BUNDLED_ADDON, '__init__.py')),
+    },
+  }
+}
+
+// 写操作 1：把 MCP 条目注册进 mcp-manager.json（先备份，结构不符就拒绝，不硬写）。
+function installMcpEntry() {
+  if (!existsSync(BRIDGE_FILE)) return fail('bridge-missing', '插件包里的 MCP 桥文件不存在，无法注册')
+  const config = readJsonFile(MCP_CONFIG)
+  if (!config || !Array.isArray(config.servers)) {
+    return fail('mcp-config-unknown', `mcp-manager.json 不存在或 servers 不是数组：${MCP_CONFIG}`)
+  }
+  const command = /node(\.exe)?$/i.test(process.execPath) ? process.execPath : 'node'
+  const entry = { serverName: MCP_SERVER_NAME, transport: 'stdio', command, args: [BRIDGE_FILE], env: {}, cwd: HERE, enabled: true }
+  const index = config.servers.findIndex((row) => row?.serverName === MCP_SERVER_NAME)
+  if (index >= 0) config.servers[index] = { ...config.servers[index], ...entry }
+  else config.servers.push(entry)
+  const backup = `${MCP_CONFIG}.bak-${new Date().toISOString().replace(/[:.]/g, '-')}`
+  try {
+    if (existsSync(MCP_CONFIG)) copyFileSync(MCP_CONFIG, backup)
+    writeJsonFile(MCP_CONFIG, config)
+  } catch (error) {
+    return fail('mcp-write-failed', `写 mcp-manager.json 失败：${errorMessage(error)}`)
+  }
+  trace(`setup installed mcp entry ${MCP_SERVER_NAME}（备份 ${backup}）`)
+  return { ok: true, value: { registered: true, backup, config: MCP_CONFIG } }
+}
+
+// 写操作 2：把 addon 拷进已检测到的 Blender 版本目录（不新建未知版本目录）。
+function installBlenderAddon() {
+  if (!existsSync(join(BUNDLED_ADDON, '__init__.py'))) return fail('addon-missing', '插件包里没有 Blender addon 文件')
+  const versions = blenderVersions()
+  if (versions.length === 0) {
+    return fail('blender-missing', '没有找到 Blender 用户目录（先启动一次 Blender 再装）')
+  }
+  const installed = []
+  const failed = []
+  for (const version of versions) {
+    const dest = join(process.env.APPDATA, 'Blender Foundation', 'Blender', version, 'scripts', 'addons', 'blender_mcp_addon')
+    try {
+      copyTree(BUNDLED_ADDON, dest)
+      installed.push(version)
+    } catch (error) {
+      failed.push(`${version}: ${errorMessage(error)}`)
+    }
+  }
+  if (installed.length === 0) return fail('addon-install-failed', `addon 没装成功：${failed.join('；')}`)
+  trace(`setup installed blender addon → ${installed.join(', ')}`)
+  return { ok: true, value: { installed, failed } }
+}
+
+// —— 自主接续：项目状态是插件的，唤醒动作走宿主真实接口 ——
+// 宿主的 Agent 实例有 followup/steer/inject（dsh-agent-loop 的循环对象），
+// followup 会往 next-turn 追加并唤醒驱动，这是「不需要用户打字也能继续」的真实通道。
+// 插件的职责只是：判断该不该唤醒、唤醒时说清下一步、不重复唤醒。
+const AUTONOMY_TICK_MS = 8 * 1000
+
+function readProjectState() {
+  return readState(DSH_HOME)
+}
+
+function saveProjectState(state) {
+  return writeState(DSH_HOME, state)
+}
+
+/** 项目操作：Host 只做分发与落盘，语义在 lib/autonomy.js 里（可被离线断言）。 */
+function projectOp(args) {
+  const op = String(args?.op ?? 'status')
+  const info = readProjectState()
+  const state = info.state
+  if (op === 'status') {
+    return JSON.stringify(projectView(state, { problem: info.problem, present: info.present }), null, 2)
+  }
+  if (op === 'stop') {
+    setStop(state, { reason: String(args?.reason ?? ''), by: 'lead' })
+    saveProjectState(state)
+    return '已停止自动接续。恢复必须由用户明确要求，然后再调用 op=resume。'
+  }
+  if (op === 'resume') {
+    clearStop(state)
+    saveProjectState(state)
+    return '已恢复自动接续。'
+  }
+  if (op === 'open') {
+    const project = openProject(state, args)
+    saveProjectState(state)
+    return `已建立项目 ${project.id}：${project.objective}`
+  }
+  const project = currentProject(state)
+  if (!project) return fail('no-project', '还没有打开的项目：先 op=open 记录目标与验收条件')
+  if (op === 'task') {
+    const task = upsertTask(project, args)
+    saveProjectState(state)
+    return `任务 ${task.id} = ${task.status}${task.owner ? ` · ${task.owner}` : ''}`
+  }
+  if (op === 'verify') {
+    const record = recordVerification(project, args)
+    saveProjectState(state)
+    return `复核 ${record.taskId} = ${record.verdict}（${record.reviewer}）`
+  }
+  if (op === 'ask') {
+    const record = addQuestion(project, args)
+    saveProjectState(state)
+    return `已记录待用户输入 ${record.id}：${record.question}`
+  }
+  if (op === 'next') {
+    project.nextAction = String(args?.text ?? '')
+    saveProjectState(state)
+    return `下一步：${project.nextAction || '（已清空）'}`
+  }
+  if (op === 'deliver') {
+    project.deliveredAt = new Date().toISOString()
+    project.status = 'closed'
+    saveProjectState(state)
+    return '项目已标记交付。'
+  }
+  return fail('unknown-op', `不认识的 op: ${op}`)
+}
+
+function leadLiveAgent() {
+  const agents = TEAM_CTX?.agents?.list?.()
+  if (!Array.isArray(agents)) return null
+  for (const agent of agents) {
+    const membership = TEAM_CTX?.agentTeams?.tryMembership?.(agent)
+    if (membership?.role === 'lead' && typeof agent?.followup === 'function') return agent
+  }
+  return null
+}
+
+function childRowsOf(leadId) {
+  const rows = []
+  for (const row of listSessions()) {
+    let parent = row.parentSession
+    if (parent === undefined) parent = readSessionHead(row.file)?.parentSession
+    if (!parent || normalizeSessionId(parent) !== normalizeSessionId(leadId)) continue
+    const tail = readSessionTail(row.file)
+    rows.push({
+      id: row.id,
+      name: row.title || row.id,
+      lastSeq: tail.event?.seq ?? null,
+      lastEventAt: tail.event?.time ?? null,
+      tailType: tail.event?.type ?? null,
+    })
+  }
+  return rows
+}
+
+function autonomyTick(state) {
+  if (state.busy) return
+  state.busy = true
+  try {
+    const { state: store } = readProjectState()
+    const project = currentProject(store)
+    if (!project) return
+    const lead = leadLiveAgent()
+    if (!lead) return
+    const children = childRowsOf(lead.id)
+    // 叫停期间如果有「本该唤醒」的新结果，记一行日志但不唤醒——这样「叫停有效」有运行证据，
+    // 而不是只靠「没动静」这种无法证伪的现象。同一个 key 只记一次。
+    if (store.stop) {
+      const would = decideContinuation({
+        state: { ...store, stop: null },
+        project,
+        children,
+        leadTurnIdle: lead.status === 'idle',
+      })
+      if (would.deliver && !(store.held ?? []).includes(would.key)) {
+        store.held = [...(store.held ?? []), would.key].slice(-200)
+        saveProjectState(store)
+        trace(`autonomy stop held wake for ${would.childId} seq=${would.lastSeq}`)
+      }
+      return
+    }
+    const decision = decideContinuation({
+      state: store,
+      project,
+      children,
+      leadTurnIdle: lead.status === 'idle',
+    })
+    if (!decision.deliver) return
+    const text = noteFor({ project, decision })
+    lead.followup({
+      id: randomUUID(),
+      role: 'user',
+      content: [{ type: 'text', text }],
+      source: { kind: 'agent-message', form: 'relay', senderSessionId: decision.childId },
+    })
+    rememberDelivery(store, decision, { text })
+    saveProjectState(store)
+    trace(`autonomy wake lead for ${decision.childId} seq=${decision.lastSeq}`)
+  } catch (error) {
+    trace(`autonomy tick FAILED: ${errorMessage(error)}`)
+  } finally {
+    state.busy = false
+  }
+}
+
+function startAutonomy() {
+  const state = { busy: false, timer: null }
+  const timer = setInterval(() => autonomyTick(state), AUTONOMY_TICK_MS)
+  if (typeof timer.unref === 'function') timer.unref()
+  state.timer = timer
+  return () => {
+    if (state.timer !== null) clearInterval(state.timer)
+    state.timer = null
+  }
+}
+
 async function handle(endpoint, payload) {
   try {
     switch (endpoint) {
       case 'state':
         return { ok: true, value: statePayload() }
+      case 'setup':
+        return { ok: true, value: setupStatus() }
+      case 'autonomy': {
+        const info = readProjectState()
+        return { ok: true, value: projectView(info.state, { problem: info.problem, present: info.present }) }
+      }
+      case 'install': {
+        // 三个写操作都只由面板按钮触发，模型侧没有对应工具动作。
+        const target = payload?.target
+        if (target === 'skills') return { ok: true, value: installBundledSkills() }
+        if (target === 'mcp') return installMcpEntry()
+        if (target === 'addon') return installBlenderAddon()
+        return fail('unknown-target', `install 的 target 只能是 skills / mcp / addon，收到：${String(target)}`)
+      }
       case 'sessions':
         return { ok: true, value: sessionsPayload(payload) }
       case 'live':
@@ -1573,11 +1998,11 @@ async function handle(endpoint, payload) {
         const { stamp } = stampOf(session.file)
         const key = `${session.id}:${stamp}`
         // 热路径：toCoordination 的最终返回值是纯函数结果，命中就一条解码都不用做。
+        // stage 与时间相关，不进缓存，命中缓存后照样现算一遍。
         const hot = cacheGet(coordinationCache, key)
-        if (hot) return { ok: true, value: hot }
-        const value = toCoordination(readSessionEvents(session.file))
-        cachePut(coordinationCache, key, value)
-        return { ok: true, value }
+        const base = hot ?? toCoordination(readSessionEvents(session.file))
+        if (!hot) cachePut(coordinationCache, key, base)
+        return { ok: true, value: tasksWithStage(base, stageContext()) }
       }
       default:
         return { ok: false, error: { code: 'unknown-endpoint', message: `unknown endpoint: ${String(endpoint)}` } }
@@ -1589,6 +2014,14 @@ async function handle(endpoint, payload) {
 
 export async function apply(ctx) {
   trace('apply start')
+
+  // 技能随插件走：装上插件就有 Blender 技能，不用自己 clone。装过什么记在 manifest 里，哈希一致就跳过。
+  try {
+    const skills = installBundledSkills()
+    if (skills.installed.length > 0) trace(`setup skills installed: ${skills.installed.join(', ')}`)
+  } catch (error) {
+    trace(`setup skills install FAILED: ${errorMessage(error)}`)
+  }
 
   const routeHandler = async (req, res) => {
     const url = new URL(req.url ?? '/', 'http://dsh.internal')
@@ -1678,6 +2111,14 @@ export async function apply(ctx) {
     })
   } catch (error) {
     trace(`team inject FAILED: ${error?.stack ?? error}`)
+  }
+
+  try {
+    // 卸载时 clearInterval：旧回调不得在新版本卸载后继续派工。
+    ctx.effect(() => startAutonomy(), 'codenow.autonomy')
+    trace('autonomy armed')
+  } catch (error) {
+    trace(`autonomy start FAILED: ${errorMessage(error)}`)
   }
 
   // 自动分配：让主模型自己按任务拉岗位子智能体，不靠用户点按钮。
@@ -1980,6 +2421,34 @@ function selfCheck() {
     return `total=${page.total} limit 上限 ${clamped.limit} / 非法 ${fallback.limit} / chat ${limits.join(',')}`
   })
 
+  check('任务 stage 只吃结构化字段（含停摆启发式与不可判定分支）', () => {
+    assert(taskStageOf.length === 2, `taskStageOf 只能接收 (task, ctx) 两个参数，实际 ${taskStageOf.length}`)
+    const ctx = { liveCount: 1, now: 1_000_000_000_000, stallMs: STALL_MS }
+    const oldAt = ctx.now - STALL_MS - 1
+    const cases = [
+      [{ status: 'completed', blockedBy: [], at: ctx.now }, 1, 'review', 'person'],
+      [{ status: 'in_progress', blockedBy: ['task-1'], at: ctx.now }, 1, 'blocked', 'agent'],
+      [{ status: 'pending', blockedBy: [], at: ctx.now }, 0, 'queued', 'none'],
+      [{ status: 'in_progress', blockedBy: [], at: ctx.now }, 1, 'working', 'agent'],
+      [{ status: 'in_progress', blockedBy: [], at: oldAt }, 0, 'stalled', 'unknown'],
+      [{ status: 'in_progress', blockedBy: [], at: oldAt }, 1, 'working', 'agent'],
+      [{ status: '', blockedBy: [], at: ctx.now }, 1, 'unknown', 'unknown'],
+    ]
+    for (const [task, liveCount, stage, waitingOn] of cases) {
+      const got = taskStageOf(task, { ...ctx, liveCount })
+      assert(
+        got.stage === stage && got.waitingOn === waitingOn,
+        `${JSON.stringify(task)} @live=${liveCount} 期望 ${stage}/${waitingOn}，实际 ${got.stage}/${got.waitingOn}`,
+      )
+    }
+    // registry 拿不到活跃成员数时不许判停摆：宁可说 working，也不误报「停摆」。
+    const blind = taskStageOf({ status: 'in_progress', blockedBy: [], at: oldAt }, { ...ctx, liveCount: null })
+    assert(blind.stage === 'working', `liveCount 未知时不应判停摆，实际 ${blind.stage}`)
+    // 重载宿主不会打断在跑的工作：首扫必须等满 10 分钟。
+    assert(FIRST_SWEEP_DELAY_MS >= 600_000, `首扫间隔必须 ≥600 秒，实际 ${FIRST_SWEEP_DELAY_MS}ms`)
+    return `${cases.length} 类映射通过；活跃数未知时不判停摆；首扫 ${FIRST_SWEEP_DELAY_MS / 1000} 秒`
+  })
+
   check('大文件尾部解码与全量解码逐字节一致', () => {
     const target = biggestSession()
     if (!target) skip(`${DSH_HOME}/sessions 下没有会话`)
@@ -2035,6 +2504,68 @@ function selfCheck() {
     assert(mate.includes('This overrides any other language instruction'), 'teammate 语言段没有声明覆盖预设的中文要求')
     assert(none === '' && other === '', '非本队身份不该被注入语言段')
     return `Lead ${lead.length} 字符（中文）/ teammate ${mate.length} 字符（纯 ASCII）/ 无身份与其它角色均不注入`
+  })
+
+  check('项目状态可读写、版本可识别、坏文件不猜', () => {
+    const home = join(tmpdir(), `cn-autonomy-${randomUUID()}`)
+    try {
+      const written = writeState(home, emptyState())
+      assert(written.version === AUTONOMY_VERSION, '版本没有写进文件')
+      const back = readState(home)
+      assert(back.present && back.problem === null, `读回失败：${back.problem}`)
+      writeFileSync(back.file, '{"version":99}', 'utf8')
+      const bad = readState(home)
+      assert(bad.problem === 'unsupported-version:99', `版本不认识时没有报出来：${bad.problem}`)
+      writeFileSync(back.file, 'not json', 'utf8')
+      const broken = readState(home)
+      assert(String(broken.problem).startsWith('parse-error'), '坏 JSON 没有被识别')
+      return `临时目录往返正常，坏版本与坏 JSON 都退回空状态并带原因`
+    } finally {
+      try {
+        rmSync(home, { recursive: true, force: true })
+      } catch {}
+    }
+  })
+
+  check('自动接续只在该唤醒时唤醒（叫停 / 去重 / Lead 忙 / 无项目）', () => {
+    const state = emptyState()
+    const project = openProject(state, { objective: '验证接续判定', acceptance: ['真实通过'] })
+    upsertTask(project, { id: 't1', title: '子任务', status: 'in_progress' })
+    const child = { id: 'c1', lastSeq: 7, tailType: 'turn/end' }
+    const base = { state, project, children: [child], leadTurnIdle: true }
+    assert(decideContinuation(base).deliver === true, '有未处理的子任务结果却没有唤醒')
+    const key = decideContinuation(base).key
+    rememberDelivery(state, decideContinuation(base))
+    assert(decideContinuation(base).deliver === false, '同一个 seq 被重复唤醒')
+    assert(state.deliveries.some((row) => row.key === key), '投递记录没有落进状态')
+    assert(decideContinuation({ ...base, leadTurnIdle: false }).reason === 'lead-busy', 'Lead 正在跑时仍然唤醒')
+    assert(decideContinuation({ ...base, project: null }).reason === 'no-open-project', '没有项目时仍然唤醒')
+    setStop(state, { reason: '用户叫停' })
+    assert(decideContinuation(base).reason === 'stopped', '叫停后仍然唤醒')
+    clearStop(state)
+    assert(decideContinuation({ ...base, children: [{ id: 'c1', lastSeq: 9, tailType: 'assistant/message' }] }).deliver === false, '回合未结束时唤醒')
+    return `已投递 ${state.deliveries.length} 条；叫停/去重/Lead 忙/无项目/回合未结束五种情况都不唤醒`
+  })
+
+  check('复核结论与阶段映射来自真实记录，不靠猜', () => {
+    const state = emptyState()
+    const project = openProject(state, { objective: '阶段映射', acceptance: ['a'] })
+    const task = upsertTask(project, { id: 't1', title: 'x', owner: 'backend-engineer', status: 'in_progress' })
+    assert(stageOfTask(task, project).stage === 'working', '进行中的任务没有映射到 working')
+    let thrown = ''
+    try {
+      recordVerification(project, { taskId: 't1', reviewer: 'backend-engineer', verdict: 'pass', evidence: 'x' })
+    } catch (error) {
+      thrown = errorMessage(error)
+    }
+    assert(thrown === 'reviewer-cannot-be-owner', `自证没有被拦住：${thrown || '（没有报错）'}`)
+    recordVerification(project, { taskId: 't1', reviewer: 'code-quality-reviewer', verdict: 'pass', evidence: '真实跑过' })
+    assert(stageOfTask(task, project).stage === 'review', '复核通过后没有进入内部复核阶段')
+    assert(stageOfTask(task, project).waitingOn === 'user', '复核通过后没有标成等待用户')
+    addQuestion(project, { taskId: 't1', kind: 'business', question: '缺口径', impact: '阻塞' })
+    task.verification = null
+    assert(stageOfTask(task, project).stage === 'needs-user', '有待用户问题时没有映射到 needs-user')
+    return 'working → review → needs-user 三段都按真实记录判定；自证被拒绝'
   })
 
   for (const result of results) {

@@ -38,12 +38,14 @@ collaboration:
     - mobile-client-engineer
     - security-engineer
     - system-architect
+    - github-repo-manager
   can_handoff_to:
     - test-engineer
     - security-engineer
     - chief-engineer
     - code-quality-reviewer
     - technical-writer
+    - github-repo-manager
   handoff_requires:
     - objective
     - build_artifacts

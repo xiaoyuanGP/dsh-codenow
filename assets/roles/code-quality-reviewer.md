@@ -28,6 +28,7 @@ boundaries:
 
 collaboration:
   can_receive_from:
+    - modeling-engineer
     - chief-engineer
     - frontend-design-engineer
     - backend-engineer
@@ -37,6 +38,10 @@ collaboration:
     - mobile-client-engineer
     - technical-writer
     - test-engineer
+    - pptx-engineer
+    - docx-engineer
+    - xlsx-engineer
+    - github-repo-manager
   can_handoff_to:
     - frontend-design-engineer
     - backend-engineer

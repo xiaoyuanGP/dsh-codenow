@@ -10,20 +10,21 @@
 
 | 数据 | 来源 | 说明 |
 | --- | --- | --- |
-| 岗位（12 个） | `assets/roles/*.md` | 沿用 Origin CodeNow 的 frontmatter 约定，当前岗位规范为 `2.2.0`；分两层：1 名首席工程师 + 11 名专家工程师，均按资深工程师的分析、实施、验证和交接标准维护 |
+| 岗位（17 个） | `assets/roles/*.md` | 沿用 Origin CodeNow 的 frontmatter 约定；分两层：1 名首席工程师 + 16 名专家工程师，均按资深工程师的分析、实施、验证和交接标准维护。版本：既有 12 份为 `2.2.0`，新增的 5 份（演示文稿、Word、Excel、GitHub 仓库、Blender 建模）为 `1.0.0` |
 | 公共规范 | `assets/roles/_common.md` | 分析规范、实施规范、协作契约三节；不是岗位（`listRoles()` 跳过 `_` 前缀），由插件前置到每份岗位全文之前 |
 | 会话与消息 | `~/.dsh/sessions/**/session[.vN].jsonl.zstd` | 多帧 zstd 串联，按帧结构（magic + 帧头 + block 遍历）逐帧切分后解压。**分代取名**：同一目录里可能同时躺着 v3 与 v4，取 N 最大的那一个（无代号按 v1）；行上带 `format`（`v4` / `v3`），本机 90 个会话里 v4 68 个、仅 v3 22 个 |
 | 会话标题 | `~/.dsh/storages/session_projcache/sessions/<uuid>.json` | `record.rows.title.val`；磁盘上同时存在 `session-<uuid>.json` 与裸 `<uuid>.json` 两种命名，两个候选都试，不能只补前缀 |
 | 各 AI 用量 / 缓存 | `~/.dsh/storages/cost-meter/ledger.json` | 按 provider/model 与按会话聚合；天级 `byProviderModel` 只在天级累加（它已经等于当日各字段之和，再叠会话级就是重复计数）；key 按**第一个**冒号切 provider / model；货币取 `config.currency`（缺省 USD） |
 | 待办 | 会话日志 `todo/write` 事件 | 取最后一条快照 |
 | 团队任务 | 会话日志 `team/task` 事件 | 权威快照，带 `status`；按 `task.id` 取 `revision` 最大的一条 |
+| 任务归属（`stage` / `waitingOn`） | 插件现算，不落盘 | 只吃结构化事实：`team/task` 的 `status` / `blockedBy` / 事件时间 + 全局活跃成员数。**不读消息文本**。宿主不给「等人回答」「投递失败」这两个信号，那两种如实返回 `unknown`，不猜 |
 | 成员存活 | 会话日志 `team/member` 事件 | `phase` = provisioning / active / ended |
 
 ## 岗位能力与使用
 
 首席负责技术决策和交付闭环，可在授权范围亲自完成小任务；专业岗位沿完整调用链处理其职责内问题。模板强调真实契约、最小方案、失败与恢复、兼容性、独立验证及有证据的交接，不强制所有任务采用某种框架或新增基础设施。
 
-Lead 在新任务开始时先通过 `codenow({ action: "role", id: "chief-engineer" })` 获取首席全文；派工前获取对应专业岗位全文。同一任务复用已读内容，模板变化后重新读取。12 份岗位的 ID、显示名、组织层级、输出字段及执行预算保持兼容。
+Lead 在新任务开始时先通过 `codenow({ action: "role", id: "chief-engineer" })` 获取首席全文；派工前获取对应专业岗位全文。同一任务复用已读内容，模板变化后重新读取。既有 12 份岗位的 ID、显示名、组织层级、输出字段及执行预算保持兼容；新增的 4 份沿用同一约定与字段。
 
 岗位全文的返回结构是 `# 显示名（id v版本 · 级别）` + `_common.md` 全文 + 岗位文件原文，三段按此顺序拼接（自检对每份岗位做**完整等值**校验，并用 5 类变异验证这条断言确实会拒绝错误输出）。因此公共方法只维护一份，各岗位文件只写自己的专业判断与交付要求；`_common.md` 缺失时自动降级为只返回岗位原文，不阻断派工。
 
@@ -35,10 +36,10 @@ Lead 在新任务开始时先通过 `codenow({ action: "role", id: "chief-engine
 
 侧边栏「协同工作台」，5 个页签：
 
-- **协同** — 12 个岗位卡片（层级、职责、可交接对象）
+- **协同** — 17 个岗位卡片（层级、职责、可交接对象）
 - **群聊** — 选会话，看真人消息与助手回复的完整时间线，向上翻页加载更早（游标取当前已加载消息里最小的 `seq`，一次 50 条；切会话或刷新时在飞的旧请求会被丢弃，不会串进新列表）
 - **会话头部** — 一个「AI 团队」按钮，点开看每个正在干活的岗位、所属主智能体及其模型；没人在跑时按钮隐藏
-- **任务** — 当前待办快照 + 团队任务（带状态列，`deleted` 的不显示）+ 协同动作流水（spawn / send_message / 任务增删）
+- **任务** — 当前待办快照 + 团队任务（带状态列与**归属列**，`deleted` 的不显示）+ 协同动作流水（spawn / send_message / 任务增删）。归属列回答「这件事现在卡在谁身上」：`等你验收` / `等上游` / `进行中` / `未开始` / `疑似停摆（推测）` / `未知`，`等你验收` 的行置顶加粗，标题上会顶出「等你处理 N」。它**只吃结构化字段**（见「数据来源」），不从消息文本猜；旧版 Host 没有这个字段时该列显示 `-`
 - **缓存** — 缓存读 / 写与命中率
 - **用量** — 总览（`totals`，全量口径）、30 个自然日趋势、按 provider/model 明细（按 cost 降序，带 `costCny`）。趋势窗口以**本地今天**为锚回溯 30 个自然日，账本没记录的日子标 `missing` 留空（不连点作弊）——账本最后一条是昨天时，今天照样出现在窗口末尾并标 `missing`
 
@@ -78,6 +79,36 @@ Lead 在新任务开始时先通过 `codenow({ action: "role", id: "chief-engine
 
 只搬磁盘上的会话目录；dsh 原生「子智能体」下拉读的是父会话日志里的 `subagent/catalog` 事件，那部分由 dsh 自己追加，插件不改写。
 
+### 重试语义
+
+搬不动的会话不一律记「失败」，按错误码分两类：
+
+| 错误码 | 记什么 | 会不会重试 |
+|---|---|---|
+| `EBUSY` / `EPERM` / `EACCES` / `ENOTEMPTY` | `sweep defer <id> <code>（下一轮重试）` | 会——宿主可能正开着这些文件，锁一松开，下一个 180 秒周期就能搬走 |
+| 其它 | `sweep move FAILED <id> …` | 不会自动重试，需要人看 |
+
+**不引入短退避**（比如 2 秒起、逐次翻倍、上限 1 分钟）：清扫是同步路径，睡在事件循环里会卡住宿主；180 秒的周期本身就已经是重试间隔。
+
+同理，`spawn_teammate` / `send_message` 失败不做重试——名额已满、成员会话已被回收、名字已占用都是硬失败，重试只会重复失败。
+
+### 插件重载会影响什么
+
+改 `index.js` 后靠 `cordis.patch.yml` 的一行变动触发重载。重载时：
+
+- **不会**取消、打断或重跑任何正在执行的会话——那些会话归宿主所有，插件只读它们的日志；
+- **不会**立刻清扫：首扫仍等满 600 秒（`FIRST_SWEEP_DELAY_MS`，自检会断言它 ≥600 秒）；
+- **会**清空进程内的三类缓存（事件、结果、协调），只影响下一次请求的速度，不影响结果正确性；
+- 在跑的 teammate 若此刻没有活跃标记也不会被搬走：`agents.list()` 拿不到 id 时整轮跳过（记 `sweep SKIPPED`）。
+
+## 自主协作
+
+项目状态落盘在 `<dshHome>/storages/codenow-autonomy/state.v1.json`（任务与单次执行分开记录，换人、重试、宿主重启都不丢任务）。`state` 载荷里多一个 `autonomy` 字段，面板据此区分「等内部」和「等你」。
+
+自动接续走宿主真实的 agent 唤醒通道，不是往对话里定时追加：插件每 8 秒读一次项目状态与派生子会话的尾事件，当某个子会话的尾巴是 `turn/end` 且这条结果还没投递过，就用 `agent.followup({id, role:'user', content, source:{kind:'agent-message', form:'relay', senderSessionId}})` 让 Lead 开新一轮，并把 `childId:lastSeq` 记进已投递列表（保留最近 200 条）避免重复唤醒。以下情况一律不唤醒：没有开放项目、已被用户叫停、Lead 正在跑、没有新的子会话结果。
+
+复核与返工也落在这份状态里：`verify` 记录复核人与结论，复核人等于任务负责人会被直接拒绝（自证不算独立复核）；结论为不通过则任务回到 `working`。
+
 ## Agent 工具
 
 `codenow`（供 Lead 取岗位全文）：
@@ -85,9 +116,11 @@ Lead 在新任务开始时先通过 `codenow({ action: "role", id: "chief-engine
 ```
 codenow({ action: "roles" })                    # 全部岗位摘要（frontmatter 解析后的字段）
 codenow({ action: "role", id: "security-engineer" })   # 岗位全文：标题行 + `_common.md` + 整份 MD 原文（含 YAML frontmatter 里的 execution / 审批项等），首行是 `# 显示名（id v版本 · 级别）`
+codenow({ action: "setup" })                    # 只读检测：内置技能 / MCP 桥 / Blender addon 装没装
+codenow({ action: "project", op: "status" })    # 项目状态；op 另有 open / task / verify / ask / next / deliver / stop / resume
 ```
 
-`state` 里的 `roles` 只有元数据（不含正文、不含磁盘路径），要全文就调 `role`——别把 12 份全文塞进一次 `state`。
+`state` 里的 `roles` 只有元数据（不含正文、不含磁盘路径），要全文就调 `role`——别把 17 份全文塞进一次 `state`。
 
 ## 安装
 
@@ -99,7 +132,7 @@ cd ~/.dsh/profiles/desktop
 # 2. 建 junction / 符号链接到 node_modules
 ```
 
-Host 端 RPC 前缀 `/codenow`，端点 `state` / `live` / `chat` / `tasks` / `sessions`。Client 通过 `connection.rpc.call` 调用，也可同源 POST 回退。
+Host 端 RPC 前缀 `/codenow`，端点 `state` / `live` / `chat` / `tasks` / `sessions` / `autonomy` / `setup` / `install`（后两个只在用户点面板按钮时用）。Client 通过 `connection.rpc.call` 调用，也可同源 POST 回退。
 
 - `sessions` 入参 `{offset, limit, q, withUsage}`：`limit` 1–200（默认 40），`q` 对 `id` / `title` / `cwd` / `preset` 做大小写不敏感子串匹配，`withUsage: true` 只返回账本里有用量记录的会话（筛选在分页之前，`total` 也是筛选后的总数）；返回 `{total, offset, limit, items}`（`total` 是过滤后的总数，不是本页条数）。
 - `chat` 入参 `{sessionId, limit, before}`：`limit` 1–500（默认 **50**）；返回 `{messages, hasMore, oldestSeq}`——`hasMore` 表示更早还有消息，翻页把 `oldestSeq` 当下一轮的 `before` 传回来即可（`before` 是事件 seq，语义是「只要 seq 比它小的消息」）。`messages` 结构与早先版本完全一致。
@@ -110,7 +143,7 @@ Host 端 RPC 前缀 `/codenow`，端点 `state` / `live` / `chat` / `tasks` / `s
 node index.js
 ```
 
-跑 12 条真断言，每条落三态 `ok` / `skip` / `FAIL`：岗位 MD 全文与交接契约、公共规范 `_common.md` 逐字节前置到每份岗位全文（等值校验，外加 5 类变异必须被拒且拒绝位置要对；并断言它没混进岗位列表）、按帧切分与旧 magic 切分逐字节一致（会话正在被追加时降级为 `skip`，不当失败）、截断到第二帧头必须报「断帧」、清扫判据（**用真实磁盘上的派生子会话驱动，不再伪造任何样本**）、干跑真实数据打印候选数与排除理由分布、`session/end-seed` 不算收尾证据（挑一个**真实**以它收尾的会话断言 `tailSettled === false`）、岗位标签精确匹配、`sessions` / `chat` 入参契约、大文件尾部解码与全量解码逐字节一致、`state` 载荷可构造、语言分段按身份分流（Lead 中文 / teammate 纯 ASCII 英文 / 其余不注入）。汇总行形如 `codenow 自检：12 通过 / 0 跳过 / 0 失败`，**只有判成 FAIL 才**让退出码非 0（skip 不计入分母）。全程只读，不移动任何目录、不写 boot log。
+跑 16 条真断言，每条落三态 `ok` / `skip` / `FAIL`：岗位 MD 全文与交接契约、公共规范 `_common.md` 逐字节前置到每份岗位全文（等值校验，外加 5 类变异必须被拒且拒绝位置要对；并断言它没混进岗位列表）、按帧切分与旧 magic 切分逐字节一致（会话正在被追加时降级为 `skip`，不当失败）、截断到第二帧头必须报「断帧」、清扫判据（**用真实磁盘上的派生子会话驱动，不再伪造任何样本**）、干跑真实数据打印候选数与排除理由分布、`session/end-seed` 不算收尾证据（挑一个**真实**以它收尾的会话断言 `tailSettled === false`）、岗位标签精确匹配、`sessions` / `chat` 入参契约、大文件尾部解码与全量解码逐字节一致、`state` 载荷可构造、语言分段按身份分流（Lead 中文 / teammate 纯 ASCII 英文 / 其余不注入）、任务 stage 只吃结构化字段（7 类映射逐一断言、活跃成员数拿不到时不许判停摆、首扫间隔 ≥600 秒）、项目状态可读写且版本可识别（坏文件不猜）、自动接续只在该唤醒时唤醒（叫停 / 去重 / Lead 忙 / 无项目四种情况逐一断言）、复核结论与阶段映射来自真实记录而不是猜（并断言自证会被拒绝）。汇总行形如 `codenow 自检：16 通过 / 0 跳过 / 0 失败`，**只有判成 FAIL 才**让退出码非 0（skip 不计入分母）。全程只读，不移动任何目录、不写 boot log。
 
 清扫判据那条只对**真实存在**的派生子会话做断言：真实候选里不允许出现「在跑 / 父会话还在 / 非 one-shot / 尾巴没收尾」的任何一条。真实数据碰不到的判据分支会单独打印 `未验证：<分支>（真实数据未覆盖）`，**既不算通过也不算失败**——它只说明这几条路径在当前机器上没法被真实样本验证，别当成已验证。
 

@@ -39,6 +39,7 @@ collaboration:
   can_receive_from:
     - chief-engineer
   can_handoff_to:
+    - modeling-engineer
     - backend-engineer
     - frontend-design-engineer
     - mobile-client-engineer
@@ -48,6 +49,7 @@ collaboration:
     - security-engineer
     - technical-writer
     - chief-engineer
+    - docx-engineer
   handoff_requires:
     - objective
     - architecture_decision

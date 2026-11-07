@@ -40,6 +40,7 @@ collaboration:
     - code-quality-reviewer
     - chief-engineer
     - technical-writer
+    - xlsx-engineer
   handoff_requires:
     - objective
     - schema_changes

@@ -46,9 +46,15 @@ collaboration:
     - data-algorithm-engineer
     - devops-sre-engineer
     - security-engineer
+    - pptx-engineer
+    - docx-engineer
   can_handoff_to:
     - code-quality-reviewer
     - chief-engineer
+    - pptx-engineer
+    - docx-engineer
+    - xlsx-engineer
+    - github-repo-manager
   handoff_requires:
     - audience_and_task
     - source_of_truth

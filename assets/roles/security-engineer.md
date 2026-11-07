@@ -37,12 +37,14 @@ collaboration:
     - frontend-design-engineer
     - mobile-client-engineer
     - system-architect
+    - github-repo-manager
   can_handoff_to:
     - backend-engineer
     - frontend-design-engineer
     - devops-sre-engineer
     - chief-engineer
     - technical-writer
+    - github-repo-manager
   handoff_requires:
     - objective
     - findings
