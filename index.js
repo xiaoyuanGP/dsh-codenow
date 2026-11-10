@@ -5,7 +5,7 @@
  * 并把 dsh 自己已有的运行数据（会话、团队动作、各 agent 用量与缓存）
  * 汇总成一个只读视图 + 一个供 Lead 编排用的 `codenow` 工具。
  *
- * 全部只读：不改会话、不写账本、不伪造数据；缺失就返回空并说明来源。
+ * 会话与账本只读；项目状态、接续入箱、安装和隔离区管理各有明确写入边界。
  */
 import { appendFileSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, readSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
@@ -15,18 +15,31 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import {
   AUTONOMY_VERSION,
   addQuestion,
+  answerQuestion,
   clearStop,
   currentProject,
   decideContinuation,
+  deliveryNeedsRetry,
+  deliveryReceipts,
+  deliverBlockers,
   emptyState,
+  legacyStorePath,
+  markDelivery,
+  migrateLegacy,
   noteFor,
   openProject,
+  openQuestions,
   projectView,
   readState,
+  receiptForChild,
+  reconcileDeliveries,
   recordVerification,
-  rememberDelivery,
+  refreshArtifacts,
+  requestContinuation,
+  safeRoot,
   setStop,
   stageOfTask,
+  storePath,
   upsertTask,
   writeState,
 } from './lib/autonomy.js'
@@ -521,6 +534,7 @@ function sessionRowOf(workspace, dirName, log) {
       id,
       workspace,
       cwd: String(head.cwd || ''),
+      parentSession: head.parentSession ? String(head.parentSession) : null,
       preset: String(head.agentPreset || ''),
       createdAt: Number(head.createdAt) || 0,
       updatedAt: stat.mtimeMs,
@@ -907,6 +921,7 @@ function sessionRow(usage) {
     id: session.id,
     title: session.title,
     cwd: session.cwd,
+    parentSession: session.parentSession,
     preset: session.preset,
     createdAt: session.createdAt,
     updatedAt: session.updatedAt,
@@ -916,7 +931,7 @@ function sessionRow(usage) {
   })
 }
 
-function statePayload() {
+function statePayload(rootSessionId) {
   const sessions = listSessions()
   const usage = readUsage()
   // 岗位只给元数据：正文（body）有 10+ KB、file 是绝对路径，都没必要进 state，取全文走 codenow 工具。
@@ -933,8 +948,8 @@ function statePayload() {
     sessions: sessions.slice(0, 40).map(sessionRow(usage)),
     // 新增（兼容：原有字段一个没动）：项目级自主状态，面板据此区分内部处理与需要用户。
     autonomy: (() => {
-      const info = readProjectState()
-      return projectView(info.state, { problem: info.problem })
+      const info = readProjectState(resolveRootSession(rootSessionId))
+      return projectView(info.state, { problem: info.problem, present: info.present })
     })(),
   }
 }
@@ -1010,7 +1025,7 @@ function roleText(roleId) {
   ].join('\n')
 }
 
-async function answer(args) {
+async function answer(args, exec) {
   const action = String(args?.action ?? 'roles')
   switch (action) {
     case 'roles': {
@@ -1026,7 +1041,7 @@ async function answer(args) {
       return JSON.stringify(setupStatus(), null, 2)
     case 'project':
       // 项目状态：目标、验收、任务、复核、待用户问题与下一步。写操作也走这里。
-      return projectOp(args?.project ?? args)
+      { const out = await projectOp(args?.project ?? args, callerOf(exec)); return out.message ?? JSON.stringify(out) }
     default:
       return `未知 action：${action}（可用：roles / role）`
   }
@@ -1034,7 +1049,7 @@ async function answer(args) {
 
 const TOOL_DEFINITION = {
   name: 'codenow',
-  description: '列出 17 个岗位模板，或取某岗位完整规范全文（可直接作为 spawn_teammate 的 prompt）。只读，不建团队。',
+  description: '列岗位/取岗位全文（只读）、查 Blender 能力（只读），或用 project 读写当前项目状态（open/task/verify/ask/answer/next/deliver/stop/resume/status）。',
   parameters: {
     type: 'object',
     properties: {
@@ -1044,16 +1059,74 @@ const TOOL_DEFINITION = {
         description: 'roles 列岗位；role 取岗位规范全文；setup 查 Blender 能力（只读）；project 读写项目状态。',
       },
       id: { type: 'string', description: '岗位 id（action=role）。' },
+      project: {
+        type: 'object',
+        description: '项目状态操作（action=project）。生命周期由 Lead 写入；verify 只能由实际独立 teammate 提交。按根会话串行。',
+        properties: {
+          op: {
+            type: 'string',
+            enum: ['status', 'open', 'task', 'verify', 'ask', 'answer', 'next', 'deliver', 'stop', 'resume', 'migrate'],
+            description: 'status 只读；open 建项目；task 建/改任务；verify 独立成员提交复核；ask/answer 记录必要问题；next 写检查点；deliver 交付；stop/resume 停止恢复；migrate 显式迁移有归属证据的旧状态。',
+          },
+          objective: { type: 'string', description: 'open：项目目标（必填）。' },
+          acceptance: {
+            type: 'array',
+            description: 'open：验收条件（必填，至少一条）。元素可以是字符串，或 {text, evidence}。',
+            items: { type: ['string', 'object'] },
+          },
+          scope: { type: 'string', description: 'open：本次不做什么。' },
+          nextAction: { type: 'string', description: 'open/next：下一步要做什么。' },
+          task: {
+            type: 'object',
+            description: 'task：任务字段；taskId 单独给时也能定位任务。',
+            properties: {
+              id: { type: 'string' },
+              title: { type: 'string' },
+              owner: { type: 'string', description: '实际执行成员 name；Lead 自己执行时填 lead。关联子会话时必须与名册一致。' },
+              status: { type: 'string', enum: ['pending', 'in_progress', 'verified', 'rework', 'blocked'] },
+              dependsOn: { type: 'array', items: { type: 'string' } },
+              artifacts: { type: 'array', items: { type: 'string' }, description: '实际文件或验证报告路径；相对路径绑定建项时的真实工作目录，不展开变量。verify/deliver 重读内容 SHA256。' },
+              blocker: {
+                type: ['object', 'null'],
+                description: '阻塞原因；kind=env 表示缺环境/凭据/授权。',
+                properties: { kind: { type: 'string', enum: ['env', 'business'] }, detail: { type: 'string' } },
+                additionalProperties: false,
+              },
+              childSessionId: { type: 'string', description: '该任务对应的子会话 id（自动接续据此把结果对回任务）。' },
+            },
+            additionalProperties: false,
+          },
+          taskId: { type: 'string', description: 'verify/ask：任务 id。' },
+          verdict: { type: 'string', enum: ['pass', 'fail'], description: 'verify：复核结论。' },
+           reviewer: { type: 'string', description: 'verify：可省略；传入时必须等于调用者在 Team 名册中的实际 name，不能代录或自证。' },
+          evidence: { type: 'string', description: 'verify：复核证据（命令/文件/数字）。' },
+          artifactStamp: { type: 'string', description: 'verify：被复核产物的版本戳，必须与任务当前戳一致。' },
+          question: { type: 'string', description: 'ask：要用户回答的问题。' },
+          kind: { type: 'string', enum: ['business', 'env'], description: 'ask：业务定义还是环境/凭据。' },
+          impact: { type: 'string', description: 'ask：不回答的后果。' },
+          questionId: { type: 'string', description: 'answer：问题 id。' },
+          answer: { type: 'string', description: 'answer：用户原话回答。' },
+          reason: { type: 'string', description: 'stop：叫停原因。' },
+          acceptanceEvidence: {
+            type: 'array',
+            description: 'deliver：逐条验收条件的证据，元素为 {text, evidence}。',
+            items: { type: 'object' },
+          },
+        },
+        required: ['op'],
+        additionalProperties: false,
+      },
     },
     required: ['action'],
     additionalProperties: false,
   },
-  isConcurrencySafe: () => true,
+  // project 写操作共享一个状态文件，不能让宿主并发调起两笔；只读 action 不受影响。
+  isConcurrencySafe: (args) => String(args?.action ?? '') !== 'project',
   output: {
     schema: { type: 'object', properties: { text: { type: 'string' } } },
     render: (_args, value) => [{ type: 'text', text: String(value?.text ?? '') }],
   },
-  execute: async (args) => ({ text: await answer(args) }),
+  execute: async (args, exec) => ({ text: await answer(args, exec) }),
 }
 
 /** 请求体上限 1MB：RPC 载荷只有 sessionId/limit/action 这类小字段，超了直接掐连接。 */
@@ -1550,7 +1623,7 @@ const CODENOW_POLICY = [
   '',
   '**语言**：你用简体中文思考和回答用户；子智能体一律用英文（其系统提示词里已内置该要求），派工 prompt 末尾仍附一行 `Reply in English.` 作为兜底。',
   '',
-  '**自主推进（项目级）**：用户给一次明确需求后，调查→计划→分派→复核→返工→集成由你连续做完，不要用「要不要继续」「是否执行下一批」结束，也不要让用户逐项点头。用 `codenow({action:"project"})` 记录：`open`（目标+验收+范围）、`task`（任务/归属/依赖）、`verify`（复核结论，必须由非 owner 给出）、`ask`（真缺业务定义才记，合并成一次）、`next`（下一步）、`deliver`（验收齐了才交付）、`stop`/`resume`。子智能体交回结果时你会被自动接回：先核对磁盘产物与复核记录再决定，不重复已完成的写操作。**叫停后必须等用户明确恢复**，不得自行 restart。普通技术取舍你自己裁决并写依据；自证不算独立复核。',
+   '**自主推进（项目级）**：用户给一次明确需求后，调查→计划→分派→复核→返工→集成连续做完，不要求逐批确认。用 `codenow({action:"project",project:{op:"status"}})` 恢复检查点；`open` 记录目标/验收/范围（同目标重试复用项目），`task` 记录实际成员 name、childSessionId、依赖及文件产物，`next` 保存下一步。复核派给独立 teammate：让它先读 status 核对当前 artifactStamp、实际文件，再亲自调用 `verify`，Lead 不得代录。`deliver` 会重读文件哈希；文件变更必须重验。`ask` 只记录缺少且无法查到的业务定义、凭据或授权，带 taskId 只阻塞该任务及后继，集中一次询问并继续其他任务；收到真实回答才 `answer`。内部复核通过后继续集成，不等用户说继续。**stop 后必须等用户明确要求才 resume**。接续仅以真实入箱和日志对账为准，端点失败、成员额度不足或独立复核缺失如实记录；不要重复已完成的副作用。',
 ].join('\n')
 
 /**
@@ -1781,154 +1854,408 @@ function installBlenderAddon() {
 // 插件的职责只是：判断该不该唤醒、唤醒时说清下一步、不重复唤醒。
 const AUTONOMY_TICK_MS = 8 * 1000
 
-function readProjectState() {
-  return readState(DSH_HOME)
+function rootOf(sessionId) {
+  return safeRoot(sessionId)
 }
 
-function saveProjectState(state) {
-  return writeState(DSH_HOME, state)
-}
-
-/** 项目操作：Host 只做分发与落盘，语义在 lib/autonomy.js 里（可被离线断言）。 */
-function projectOp(args) {
-  const op = String(args?.op ?? 'status')
-  const info = readProjectState()
-  const state = info.state
-  if (op === 'status') {
-    return JSON.stringify(projectView(state, { problem: info.problem, present: info.present }), null, 2)
-  }
-  if (op === 'stop') {
-    setStop(state, { reason: String(args?.reason ?? ''), by: 'lead' })
-    saveProjectState(state)
-    return '已停止自动接续。恢复必须由用户明确要求，然后再调用 op=resume。'
-  }
-  if (op === 'resume') {
-    clearStop(state)
-    saveProjectState(state)
-    return '已恢复自动接续。'
-  }
-  if (op === 'open') {
-    const project = openProject(state, args)
-    saveProjectState(state)
-    return `已建立项目 ${project.id}：${project.objective}`
-  }
-  const project = currentProject(state)
-  if (!project) return fail('no-project', '还没有打开的项目：先 op=open 记录目标与验收条件')
-  if (op === 'task') {
-    const task = upsertTask(project, args)
-    saveProjectState(state)
-    return `任务 ${task.id} = ${task.status}${task.owner ? ` · ${task.owner}` : ''}`
-  }
-  if (op === 'verify') {
-    const record = recordVerification(project, args)
-    saveProjectState(state)
-    return `复核 ${record.taskId} = ${record.verdict}（${record.reviewer}）`
-  }
-  if (op === 'ask') {
-    const record = addQuestion(project, args)
-    saveProjectState(state)
-    return `已记录待用户输入 ${record.id}：${record.question}`
-  }
-  if (op === 'next') {
-    project.nextAction = String(args?.text ?? '')
-    saveProjectState(state)
-    return `下一步：${project.nextAction || '（已清空）'}`
-  }
-  if (op === 'deliver') {
-    project.deliveredAt = new Date().toISOString()
-    project.status = 'closed'
-    saveProjectState(state)
-    return '项目已标记交付。'
-  }
-  return fail('unknown-op', `不认识的 op: ${op}`)
-}
-
-function leadLiveAgent() {
-  const agents = TEAM_CTX?.agents?.list?.()
-  if (!Array.isArray(agents)) return null
-  for (const agent of agents) {
-    const membership = TEAM_CTX?.agentTeams?.tryMembership?.(agent)
-    if (membership?.role === 'lead' && typeof agent?.followup === 'function') return agent
+/** 面板可选子会话；沿真实 header 找根，不把子会话 id 当成项目存储目录。 */
+function resolveRootSession(sessionId) {
+  if (!rootOf(sessionId)) return null
+  const seen = new Set()
+  let row = findSession(sessionId)
+  while (row && seen.size < 32) {
+    const id = rootOf(row.id)
+    if (!id || seen.has(id)) return null
+    seen.add(id)
+    if (!row.parentSession) return id
+    row = findSession(row.parentSession)
   }
   return null
 }
 
-function childRowsOf(leadId) {
-  const rows = []
-  for (const row of listSessions()) {
-    let parent = row.parentSession
-    if (parent === undefined) parent = readSessionHead(row.file)?.parentSession
-    if (!parent || normalizeSessionId(parent) !== normalizeSessionId(leadId)) continue
-    const tail = readSessionTail(row.file)
-    rows.push({
-      id: row.id,
-      name: row.title || row.id,
-      lastSeq: tail.event?.seq ?? null,
-      lastEventAt: tail.event?.time ?? null,
-      tailType: tail.event?.type ?? null,
-    })
-  }
-  return rows
+function readProjectState(rootSessionId) {
+  const root = rootOf(rootSessionId)
+  if (!root) return { state: emptyState(null), present: false, problem: 'no-root-session' }
+  return readState(DSH_HOME, root)
 }
 
-function autonomyTick(state) {
-  if (state.busy) return
-  state.busy = true
+function saveProjectState(rootSessionId, state) {
+  const root = rootOf(rootSessionId)
+  if (!root) throw new Error('no-root-session')
+  return writeState(DSH_HOME, root, state)
+}
+
+/** 调用者身份只认 exec 里的真实会话与 Team 名册：参数里写的身份一概不采信。 */
+function callerOf(exec) {
+  const sessionId = rootOf(exec?.agent?.session?.id)
+  if (!sessionId) return { ok: false, reason: 'no-session-id' }
+  const agent = exec?.agent ?? null
+  let membership = null
   try {
-    const { state: store } = readProjectState()
-    const project = currentProject(store)
-    if (!project) return
-    const lead = leadLiveAgent()
-    if (!lead) return
-    const children = childRowsOf(lead.id)
-    // 叫停期间如果有「本该唤醒」的新结果，记一行日志但不唤醒——这样「叫停有效」有运行证据，
-    // 而不是只靠「没动静」这种无法证伪的现象。同一个 key 只记一次。
-    if (store.stop) {
-      const would = decideContinuation({
-        state: { ...store, stop: null },
-        project,
-        children,
-        leadTurnIdle: lead.status === 'idle',
+    membership = TEAM_CTX?.agentTeams?.tryMembership?.(agent) ?? null
+  } catch {
+    membership = null
+  }
+  const rootSessionId = rootOf(membership?.root?.id)
+  if (!membership || !rootSessionId) return { ok: false, reason: 'no-team-membership' }
+  // 工作目录按可信度降级：服务给出的 committed 目录 > 会话 header 记录的 cwd > 未知。
+  // 都不猜：拿不到就交 null，让需要它的产物校验自己报「缺少项目实际工作目录」。
+  let cwd = null
+  let cwdSource = 'unknown'
+  try {
+    const fromService = agent.ctx?.get?.('workingDirectory')?.get?.(membership.root.session) ?? null
+    if (fromService) { cwd = String(fromService); cwdSource = 'working-directory-service' }
+  } catch {}
+  if (!cwd) {
+    try {
+      const row = findSession(rootSessionId)
+      if (row?.cwd) { cwd = String(row.cwd); cwdSource = 'session-header' }
+    } catch {}
+  }
+  return { ok: true, sessionId, rootSessionId, role: membership.role, name: membership.name,
+    agent, cwd, cwdSource, callId: exec?.callId ?? null }
+}
+
+/** 项目写操作串行：同一个 root 上一次只跑一笔，避免读改写互相覆盖。 */
+const PROJECT_QUEUES = new Map()
+
+function withProjectLock(root, fn) {
+  const prev = PROJECT_QUEUES.get(root) ?? Promise.resolve()
+  const next = prev.then(fn, fn)
+  const settled = next.then(() => {}, () => {}).then(() => {
+    if (PROJECT_QUEUES.get(root) === settled) PROJECT_QUEUES.delete(root)
+  })
+  PROJECT_QUEUES.set(root, settled)
+  return next
+}
+
+function projectStatusText(root) {
+  const info = readProjectState(root)
+  const project = currentProject(info.state)
+  if (project) refreshArtifacts(project)
+  const view = projectView(info.state, { problem: info.problem, present: info.present })
+  return JSON.stringify({ rootSessionId: root, migrated: info.migrated ?? false, ...view }, null, 2)
+}
+
+/** 把 deliver 现给的验收证据贴到项目的验收条件上（只贴文本能对上的那些）。 */
+function applyAcceptanceEvidence(project, rows) {
+  const list = Array.isArray(rows) ? rows : []
+  const merged = (project.acceptance ?? []).map((row) => {
+    const hit = list.find((item) => String(item?.text ?? '').trim() === row.text)
+    return hit ? { ...row, evidence: String(hit.evidence ?? '').trim() } : row
+  })
+  return merged
+}
+
+async function projectOp(input, caller) {
+  const op = String(input?.op ?? '').trim()
+  const root = caller?.rootSessionId ?? null
+  if (!caller?.ok) return { ok: false, message: `拿不到当前会话身份，拒绝访问项目状态（${caller?.reason ?? 'unknown'}）` }
+  if (op === 'status' || op === '') return { ok: true, message: projectStatusText(root) }
+  // 复核只能由独立成员亲自提交；Lead 负责其余生命周期。
+  if (op === 'verify' ? caller.role !== 'teammate' : caller.role !== 'lead') {
+    return { ok: false, message: `${op === 'verify' ? '只有实际独立 teammate 能提交复核，Lead 不能代录' : '只有当前项目的 Lead 能执行此操作'}（${op}；当前身份：${caller.name ?? '未知'}）` }
+  }
+  return withProjectLock(root, async () => {
+    if (op === 'migrate') {
+      const result = migrateLegacy(DSH_HOME, root)
+      return { ok: !result.problem, message: result.problem ?? (result.migrated ? '已迁移，原文件及备份保留。' : '无需迁移。') }
+    }
+    const info = readProjectState(root)
+    // 坏文件、未知版本一律不写，避免把用户数据覆盖成空状态。
+    if (info.problem) return { ok: false, message: `项目状态文件不可用（${info.problem}），已拒绝写入；请先备份并人工处理` }
+    const state = info.state
+    const guarded = (label, fn) => {
+      try {
+        return fn()
+      } catch (error) {
+        return { ok: false, message: `${label} 被拒绝：${errorMessage(error)}` }
+      }
+    }
+    if (op === 'open') {
+      return guarded('open', () => {
+        const project = openProject(state, { ...input, cwd: caller.cwd, cwdSource: caller.cwdSource })
+        saveProjectState(root, state)
+        return { ok: true, message: `已建立项目 ${project.id}（验收 ${project.acceptance.length} 条）` }
       })
-      if (would.deliver && !(store.held ?? []).includes(would.key)) {
-        store.held = [...(store.held ?? []), would.key].slice(-200)
-        saveProjectState(store)
-        trace(`autonomy stop held wake for ${would.childId} seq=${would.lastSeq}`)
+    }
+    if (op === 'resume') {
+      clearStop(state)
+      const project = currentProject(state)
+      if (project) requestContinuation(project, '已恢复，继续检查点')
+      saveProjectState(root, state)
+      return { ok: true, message: '已恢复自动接续。' }
+    }
+    const project = currentProject(state)
+    // 早期项目可能没记 cwd：后续任一次带可信 cwd 的写操作补上并留痕，不改历史结论。
+    if (project && !project.cwd && caller.cwd) {
+      project.cwd = String(caller.cwd)
+      project.cwdFilledAt = new Date().toISOString()
+      project.cwdSource = caller.cwdSource ?? 'unknown'
+    }
+    if (!project) return { ok: false, message: '当前没有打开的项目，先用 op=open 建立' }
+    if (op === 'stop') {
+      setStop(state, { reason: input?.reason, by: caller.name ?? 'lead' })
+      saveProjectState(root, state)
+      return { ok: true, message: '已停止自动接续。恢复必须由用户明确要求，然后再调用 op=resume。' }
+    }
+    if (op === 'task') {
+      return guarded('task', () => {
+        const fields = { ...(input?.task ?? input) }
+        const before = project.tasks.find((row) => row.id === fields.id)
+        // 显式传 childSessionId:null 表示解绑：成员离开名册后仍要能接手/收尾，不然整条任务永久卡死。
+        const clearing = fields.childSessionId === null
+        const childId = clearing ? null : (fields.childSessionId ?? before?.childSessionId)
+        if (clearing) {
+          fields.childSessionId = null
+        } else if (childId) {
+          const member = TEAM_CTX.agentTeams.listMembers(caller.agent).find((row) => rootOf(row.id) === rootOf(childId) && row.role === 'teammate')
+          if (!member) throw new Error('child-not-in-team')
+          if (fields.owner && fields.owner !== member.name) throw new Error('owner-must-match-team-name')
+          fields.owner = member.name
+          fields.childSessionId = rootOf(member.id)
+        }
+        fields.ownerSessionId = fields.childSessionId ?? ((fields.owner ?? before?.owner) === 'lead' ? root : null)
+        const task = upsertTask(project, fields)
+        refreshArtifacts(project)
+        if (!before || ['status', 'owner', 'childSessionId', 'artifactStamp'].some((key) => before[key] !== task[key])) requestContinuation(project, '任务检查点已更新', task.id)
+        saveProjectState(root, state)
+        return { ok: true, message: `任务 ${task.id}：${task.status}（artifactStamp ${task.artifactStamp}）` }
+      })
+    }
+    if (op === 'verify') {
+      const reviewer = caller.name
+      if (input?.reviewer && input.reviewer !== reviewer) {
+        return { ok: false, message: 'reviewer 与实际调用成员不一致，拒绝代录。' }
+      }
+      try {
+        refreshArtifacts(project)
+        const record = recordVerification(project, {
+          taskId: input?.taskId ?? input?.task?.id,
+          verdict: input?.verdict,
+          reviewer,
+          evidence: input?.evidence,
+          artifactStamp: input?.artifactStamp,
+          by: caller.name,
+          reviewerSessionId: caller.sessionId,
+          callId: caller.callId,
+          source: 'team-tool',
+        })
+        saveProjectState(root, state)
+        return { ok: true, message: `已记录复核：${record.taskId} ${record.verdict}（复核者 ${record.reviewer}，记录者 ${record.by}）` }
+      } catch (error) {
+        return { ok: false, message: `复核被拒绝：${errorMessage(error)}` }
+      }
+    }
+    if (op === 'ask') {
+      return guarded('ask', () => {
+        const question = addQuestion(project, input)
+        saveProjectState(root, state)
+        return { ok: true, message: `已提问 ${question.id}：${question.question}（回答时用 op=answer questionId=${question.id}）` }
+      })
+    }
+    if (op === 'answer') {
+      try {
+        const row = answerQuestion(project, { questionId: input?.questionId, answer: input?.answer, answeredBy: caller.name ?? 'user' })
+        requestContinuation(project, '必要问题已回答，继续受影响任务', row.taskId)
+        saveProjectState(root, state)
+        return { ok: true, message: `已记录 ${row.id} 的回答（回答者 ${row.answeredBy}），自动接续恢复` }
+      } catch (error) {
+        return { ok: false, message: `回答被拒绝：${errorMessage(error)}` }
+      }
+    }
+    if (op === 'next') {
+      const nextAction = String(input?.nextAction ?? '').trim()
+      if (nextAction !== project.nextAction) requestContinuation(project, '下一步已保存')
+      project.nextAction = nextAction
+      saveProjectState(root, state)
+      return { ok: true, message: `下一步已更新：${project.nextAction || '（空）'}` }
+    }
+    if (op === 'deliver') {
+      project.acceptance = applyAcceptanceEvidence(project, input?.acceptanceEvidence)
+      refreshArtifacts(project)
+      reconcileDeliveries(state, readLeadReceipts(root))
+      const blockers = deliverBlockers(project, state)
+      if (blockers.length > 0) {
+        saveProjectState(root, state)
+        return { ok: false, message: `交付被拒绝（项目保持打开）：${blockers.join('；')}` }
+      }
+      project.deliveredAt = new Date().toISOString()
+      project.status = 'delivered'
+      saveProjectState(root, state)
+      return { ok: true, message: `项目 ${project.id} 已交付。` }
+    }
+    return { ok: false, message: `未知 op：${op}（可用：status/open/task/verify/ask/answer/next/deliver/stop/resume/migrate）` }
+  })
+}
+
+function liveLeadAgents() {
+  if (!TEAM_CTX) return []
+  let list = []
+  try {
+    list = TEAM_CTX.agents?.list?.() ?? []
+  } catch {
+    return []
+  }
+  return list.filter((agent) => {
+    try {
+      return TEAM_CTX.agentTeams?.tryMembership?.(agent)?.role === 'lead' && typeof agent?.followup === 'function'
+    } catch {
+      return false
+    }
+  })
+}
+
+function childRowsOf(parentId) {
+  return listSessions()
+    .filter((row) => row.parentSession && rootOf(row.parentSession) === rootOf(parentId))
+    .map((row) => {
+      const tail = readSessionTail(row.file)
+      return {
+        id: row.id,
+        name: row.title || row.id,
+        lastSeq: tail?.event?.seq ?? null,
+        lastEventAt: tail?.event?.time ?? null,
+        tailType: tail?.event?.type ?? null,
+        endReason: tail?.event?.data?.reason?.kind ?? null,
+      }
+    })
+    .filter((row) => Boolean(row.id))
+}
+
+const RECEIPT_CACHE = new Map()
+
+/** 完整且稳定的日志才可用于证明消息缺席；只缓存小型收据，不常驻整份事件。 */
+function readLeadReceipts(root) {
+  try {
+    const row = findSession(root)
+    if (!row) return null
+    const before = stampOf(row.file).stamp
+    if (RECEIPT_CACHE.get(root)?.stamp === before) return RECEIPT_CACHE.get(root).receipts
+    const events = decodeSession(readFileSync(row.file)).split('\n').filter((line) => line.trim()).map((line) => JSON.parse(line))
+    const receipts = deliveryReceipts(events)
+    if (stampOf(row.file).stamp !== before) return null
+    RECEIPT_CACHE.set(root, { stamp: before, receipts })
+    while (RECEIPT_CACHE.size > 4) RECEIPT_CACHE.delete(RECEIPT_CACHE.keys().next().value)
+    return receipts
+  } catch {
+    return null
+  }
+}
+
+/** 与 projectOp 共用根锁：持久化消息 id 后投递，崩溃窗口由真实 inbox 对账恢复。 */
+async function autonomyTickFor(root, lead, control) {
+  return withProjectLock(root, async () => {
+    if (control.disposed || lead.status !== 'idle') return
+    const info = readProjectState(root)
+    if (info.problem) return
+    const state = info.state
+    const project = currentProject(state)
+    if (!project || state.stop) return
+    const before = JSON.stringify(state)
+    const receipts = readLeadReceipts(root)
+    reconcileDeliveries(state, receipts)
+    state.reconciliationProblem = receipts === null ? 'lead-log-unavailable' : null
+    if (receipts === null) {
+      if (JSON.stringify(state) !== before) saveProjectState(root, state)
+      return
+    }
+    // 先做投递恢复：进程在 sending 中途挂掉、或上一轮 followup 抛错的，这里按退避重试；
+    // 同一 messageId 复用，宿主侧按 id 去重，不会因为重试变成两次唤醒。
+    const nowMs = Date.now()
+    const due = Object.values(state.deliveries ?? {})
+      .filter((row) => (row.projectId ?? project.id) === project.id && deliveryNeedsRetry(row, nowMs))
+      .sort((a, b) => String(a.at ?? '').localeCompare(String(b.at ?? '')))[0]
+    if (due) {
+      const attempt = Number(due.attempts ?? 0) + 1
+      markDelivery(state, { ...due, text: due.text }, 'sending', null)
+      saveProjectState(root, state)
+      try {
+        await lead.followup({
+          id: due.messageId,
+          role: 'user',
+          content: [{ type: 'text', text: due.text ?? noteFor({ project, decision: due }) }],
+          source: { kind: 'agent-message', form: 'relay', senderSessionId: due.childSessionId ?? lead.id },
+        })
+        markDelivery(state, { ...due }, 'sent', null)
+        saveProjectState(root, state)
+        trace(`autonomy retry ok message=${due.messageId} attempt=${attempt}`)
+      } catch (error) {
+        markDelivery(state, { ...due, retryAt: new Date(Date.now() + 60_000 * attempt).toISOString() }, 'unknown', errorMessage(error))
+        saveProjectState(root, state)
+        trace(`autonomy retry FAILED message=${due.messageId} attempt=${attempt}: ${errorMessage(error)}`)
       }
       return
     }
+    const children = childRowsOf(lead.id)
+    const taskOfChild = (child) => {
+      const tasks = (project.tasks ?? []).filter((task) => task.childSessionId && rootOf(task.childSessionId) === rootOf(child.id))
+      return tasks.length === 1 ? tasks[0].id : null
+    }
     const decision = decideContinuation({
-      state: store,
+      state,
       project,
       children,
       leadTurnIdle: lead.status === 'idle',
+      taskOfChild,
     })
-    if (!decision.deliver) return
-    const text = noteFor({ project, decision })
-    lead.followup({
-      id: randomUUID(),
-      role: 'user',
-      content: [{ type: 'text', text }],
-      source: { kind: 'agent-message', form: 'relay', senderSessionId: decision.childId },
-    })
-    rememberDelivery(store, decision, { text })
-    saveProjectState(store)
-    trace(`autonomy wake lead for ${decision.childId} seq=${decision.lastSeq}`)
-  } catch (error) {
+    state.unmapped = decision.unmapped ?? []
+    if (!decision.deliver) {
+      if (JSON.stringify(state) !== before) saveProjectState(root, state)
+      return
+    }
+    const child = children.find((row) => rootOf(row.id) === rootOf(decision.childId))
+    const hostReceipt = child ? receiptForChild(receipts, child) : null
+    if (hostReceipt) {
+      markDelivery(state, { ...decision, messageId: hostReceipt.id, origin: 'host' }, hostReceipt.status === 'claimed' ? 'unknown' : hostReceipt.status)
+      project.continuation = null
+      saveProjectState(root, state)
+      return
+    }
+    if (control.disposed || lead.status !== 'idle') return
+    const noteText = noteFor({ project, decision })
+    const delivery = markDelivery(state, { ...decision, text: noteText }, 'sending', null)
+    saveProjectState(root, state)
+    try {
+      await lead.followup({
+        id: delivery.messageId,
+        role: 'user',
+        content: [{ type: 'text', text: noteText }],
+        source: { kind: 'agent-message', form: 'relay', senderSessionId: decision.childId ?? lead.id },
+      })
+      markDelivery(state, decision, 'sent', null)
+      if (decision.childId) project.continuation = null
+      saveProjectState(root, state)
+      trace(`autonomy queued message=${delivery.messageId} project=${project.id} task=${decision.taskId ?? '-'} child=${decision.childId ?? '-'} seq=${decision.lastSeq ?? '-'}`)
+    } catch (error) {
+      markDelivery(state, decision, 'unknown', errorMessage(error))
+      saveProjectState(root, state)
+      trace(`autonomy wake FAILED for ${decision.childId} seq=${decision.lastSeq}: ${errorMessage(error)}`)
+    }
+  }).catch((error) => {
     trace(`autonomy tick FAILED: ${errorMessage(error)}`)
-  } finally {
-    state.busy = false
-  }
+  })
 }
 
+async function autonomyTick(control) {
+  for (const lead of liveLeadAgents()) {
+    if (control.disposed) break
+    const root = rootOf(lead?.id) ?? rootOf(lead?.session?.id)
+    if (!root) continue
+    await autonomyTickFor(root, lead, control)
+  }
+}
 function startAutonomy() {
-  const state = { busy: false, timer: null }
-  const timer = setInterval(() => autonomyTick(state), AUTONOMY_TICK_MS)
+  const control = { disposed: false }
+  let flight = null
+  const timer = setInterval(() => {
+    if (!control.disposed && !flight) flight = autonomyTick(control).finally(() => { flight = null })
+  }, AUTONOMY_TICK_MS)
   if (typeof timer.unref === 'function') timer.unref()
-  state.timer = timer
-  return () => {
-    if (state.timer !== null) clearInterval(state.timer)
-    state.timer = null
+  return async () => {
+    control.disposed = true
+    clearInterval(timer)
+    await flight
   }
 }
 
@@ -1936,11 +2263,11 @@ async function handle(endpoint, payload) {
   try {
     switch (endpoint) {
       case 'state':
-        return { ok: true, value: statePayload() }
+        return { ok: true, value: statePayload(payload?.sessionId) }
       case 'setup':
         return { ok: true, value: setupStatus() }
       case 'autonomy': {
-        const info = readProjectState()
+        const info = readProjectState(resolveRootSession(payload?.sessionId))
         return { ok: true, value: projectView(info.state, { problem: info.problem, present: info.present }) }
       }
       case 'install': {
@@ -2506,68 +2833,154 @@ function selfCheck() {
     return `Lead ${lead.length} 字符（中文）/ teammate ${mate.length} 字符（纯 ASCII）/ 无身份与其它角色均不注入`
   })
 
-  check('项目状态可读写、版本可识别、坏文件不猜', () => {
+  check('项目状态按 root 隔离、迁移必须显式、坏文件不猜', () => {
     const home = join(tmpdir(), `cn-autonomy-${randomUUID()}`)
+    const legacyHome = join(tmpdir(), `cn-autonomy-legacy-${randomUUID()}`)
+    const noRootHome = join(tmpdir(), `cn-autonomy-noroot-${randomUUID()}`)
     try {
-      const written = writeState(home, emptyState())
-      assert(written.version === AUTONOMY_VERSION, '版本没有写进文件')
-      const back = readState(home)
-      assert(back.present && back.problem === null, `读回失败：${back.problem}`)
-      writeFileSync(back.file, '{"version":99}', 'utf8')
-      const bad = readState(home)
-      assert(bad.problem === 'unsupported-version:99', `版本不认识时没有报出来：${bad.problem}`)
-      writeFileSync(back.file, 'not json', 'utf8')
-      const broken = readState(home)
-      assert(String(broken.problem).startsWith('parse-error'), '坏 JSON 没有被识别')
-      return `临时目录往返正常，坏版本与坏 JSON 都退回空状态并带原因`
+      assert(storePath(home, '../escape') === null, '非法 root 竟然拼出了路径')
+      const rootA = 'session-a'
+      const rootB = 'session-b'
+      writeState(home, rootA, emptyState(rootA))
+      const a = readState(home, rootA).state
+      openProject(a, { objective: 'A 的项目', acceptance: ['a1'] })
+      writeState(home, rootA, a)
+      assert(readState(home, rootB).state.projects.length === 0, 'B 读到了 A 的项目（root 没隔离）')
+      assert(readState(home, rootA).state.projects.length === 1, 'A 的项目没落盘')
+
+      writeState(home, rootB, emptyState(rootB))
+      writeFileSync(storePath(home, rootB), '{"version":99}', 'utf8')
+      assert(readState(home, rootB).problem === 'unsupported-version:99', '未知版本没报出来')
+      writeFileSync(storePath(home, rootB), 'not json', 'utf8')
+      assert(String(readState(home, rootB).problem).startsWith('parse-error'), '坏 JSON 没被识别')
+
+      mkdirSync(dirname(legacyStorePath(legacyHome)), { recursive: true })
+      writeFileSync(legacyStorePath(legacyHome), JSON.stringify({
+        version: 1,
+        rootSessionId: 'session-old',
+        stop: null,
+        projects: [{ id: 'p1', objective: '旧项目', acceptance: ['旧验收'], tasks: [], questions: [], verifications: [], continuation: null }],
+        deliveries: [{ key: 'c1:5', childId: 'c1', seq: 5 }],
+      }), 'utf8')
+      assert(readState(legacyHome, 'session-old').problem === 'legacy-migration-required', '读取时不该隐式迁移')
+      const migrated = migrateLegacy(legacyHome, 'session-old')
+      assert(migrated.migrated === true && migrated.problem === null, `显式迁移失败：${migrated.problem}`)
+      const after = readState(legacyHome, 'session-old').state
+      assert(after.projects[0].acceptance[0].text === '旧验收', '验收条目没转成 {text,evidence}')
+      assert(Object.keys(after.deliveries).length === 1, '旧投递记录没转成对象表')
+
+      mkdirSync(dirname(legacyStorePath(noRootHome)), { recursive: true })
+      writeFileSync(legacyStorePath(noRootHome), JSON.stringify({ version: 1, projects: [], deliveries: [] }), 'utf8')
+      const refused = migrateLegacy(noRootHome, 'session-new')
+      assert(refused.migrated === false && refused.problem === 'legacy-owner-unverified', '没有归属的旧文件被强行迁移')
+      assert(existsSync(legacyStorePath(noRootHome)), '被拒绝的旧文件被删了')
+      return 'root 隔离、未知版本、坏 JSON、显式迁移、无归属拒绝，全部按预期'
     } finally {
-      try {
-        rmSync(home, { recursive: true, force: true })
-      } catch {}
+      try { rmSync(home, { recursive: true, force: true }) } catch {}
+      try { rmSync(legacyHome, { recursive: true, force: true }) } catch {}
+      try { rmSync(noRootHome, { recursive: true, force: true }) } catch {}
     }
   })
 
-  check('自动接续只在该唤醒时唤醒（叫停 / 去重 / Lead 忙 / 无项目）', () => {
-    const state = emptyState()
+  check('自动接续只认 turn/end、早于登记的结果标 lateBind 不丢、必须能对回任务', () => {
+    const state = emptyState('session-1')
     const project = openProject(state, { objective: '验证接续判定', acceptance: ['真实通过'] })
-    upsertTask(project, { id: 't1', title: '子任务', status: 'in_progress' })
-    const child = { id: 'c1', lastSeq: 7, tailType: 'turn/end' }
-    const base = { state, project, children: [child], leadTurnIdle: true }
-    assert(decideContinuation(base).deliver === true, '有未处理的子任务结果却没有唤醒')
-    const key = decideContinuation(base).key
-    rememberDelivery(state, decideContinuation(base))
+    const task = upsertTask(project, { id: 't1', title: '子任务', owner: 'backend-engineer', ownerSessionId: 'session-owner', status: 'in_progress', childSessionId: 'session-c1' })
+    const taskOfChild = (child) => (child.id === task.childSessionId ? 't1' : null)
+    const child = { id: 'session-c1', lastSeq: 7, tailType: 'turn/end', lastEventAt: new Date(Date.now() + 1000).toISOString() }
+    const base = { state, project, children: [child], leadTurnIdle: true, taskOfChild }
+    const first = decideContinuation(base)
+    assert(first.deliver === true && first.taskId === 't1', '有未处理的 turn/end 却没唤醒或没对回任务')
+    assert(String(first.key).includes(':session-c1:'), `投递键没带归一化子会话 id：${first.key}`)
+    // 早于登记时间的结果不丢弃：先完成后补登记真实存在，改成投递并标 lateBind 让 Lead 判断。
+    const late = decideContinuation({ ...base, children: [{ ...child, lastEventAt: '2020-01-01T00:00:00Z' }] })
+    assert(late.deliver === true && late.lateBind === true, `登记之前的结果被丢掉或没标 lateBind：${JSON.stringify({ deliver: late.deliver, lateBind: late.lateBind })}`)
+    assert(decideContinuation({ ...base, children: [{ ...child, tailType: 'session/end-seed' }] }).deliver === false, 'session/end-seed 被当成完成信号')
+    assert(decideContinuation({ ...base, taskOfChild: () => null }).reason === 'unmapped-child', '对不回任务的子会话仍然投递')
+    markDelivery(state, first, 'sent', null)
     assert(decideContinuation(base).deliver === false, '同一个 seq 被重复唤醒')
-    assert(state.deliveries.some((row) => row.key === key), '投递记录没有落进状态')
+    assert(state.deliveries[first.key]?.status === 'sent', '投递状态没落进状态表')
     assert(decideContinuation({ ...base, leadTurnIdle: false }).reason === 'lead-busy', 'Lead 正在跑时仍然唤醒')
     assert(decideContinuation({ ...base, project: null }).reason === 'no-open-project', '没有项目时仍然唤醒')
+    addQuestion(project, { taskId: 't1', kind: 'business', question: '缺口径' })
+    const blocked = decideContinuation({ ...base, children: [{ ...child, lastSeq: 8 }] })
+    assert(blocked.deliver === false && blocked.reason === 'tasks-blocked', `任务级未答问题没挡住接续：`)
+    answerQuestion(project, { questionId: project.questions[0].id, answer: '按 123' })
     setStop(state, { reason: '用户叫停' })
-    assert(decideContinuation(base).reason === 'stopped', '叫停后仍然唤醒')
-    clearStop(state)
-    assert(decideContinuation({ ...base, children: [{ id: 'c1', lastSeq: 9, tailType: 'assistant/message' }] }).deliver === false, '回合未结束时唤醒')
-    return `已投递 ${state.deliveries.length} 条；叫停/去重/Lead 忙/无项目/回合未结束五种情况都不唤醒`
+    assert(decideContinuation({ ...base, children: [{ ...child, lastSeq: 9 }] }).reason === 'stopped', '叫停后仍然唤醒')
+    return '只认 turn/end 与登记之后的结果；end-seed、登记前结果、无映射、重复 seq、Lead 忙、无项目、待用户、叫停都不唤醒'
   })
 
-  check('复核结论与阶段映射来自真实记录，不靠猜', () => {
-    const state = emptyState()
-    const project = openProject(state, { objective: '阶段映射', acceptance: ['a'] })
-    const task = upsertTask(project, { id: 't1', title: 'x', owner: 'backend-engineer', status: 'in_progress' })
-    assert(stageOfTask(task, project).stage === 'working', '进行中的任务没有映射到 working')
-    let thrown = ''
+  check('投递恢复只重试该重试的（退避、上限、状态机）', () => {
+    const nowMs = Date.now()
+    const base = { key: 'r:c:5', messageId: 'm1', attempts: 1, text: 'n' }
+    const stale = { ...base, status: 'sending', at: new Date(nowMs - 120000).toISOString() + '#9' }
+    const fresh = { ...base, status: 'sending', at: new Date(nowMs - 1000).toISOString() + '#9' }
+    if (!deliveryNeedsRetry(stale, nowMs)) throw new Error('sending 超过窗口应重试')
+    if (deliveryNeedsRetry(fresh, nowMs)) throw new Error('sending 刚发出不该重试')
+    if (!deliveryNeedsRetry({ ...base, status: 'unknown', retryAt: new Date(nowMs - 1).toISOString() }, nowMs)) throw new Error('退避到期应重试')
+    if (deliveryNeedsRetry({ ...base, status: 'unknown', retryAt: new Date(nowMs + 60000).toISOString() }, nowMs)) throw new Error('退避未到不该重试')
+    if (deliveryNeedsRetry({ ...base, attempts: 3, status: 'unknown' }, nowMs)) throw new Error('跑满上限不该重试')
+    if (deliveryNeedsRetry({ ...base, status: 'sent' }, nowMs)) throw new Error('sent 不该重试')
+    if (deliveryNeedsRetry({ ...base, status: 'consumed' }, nowMs)) throw new Error('consumed 不该重试')
+    if (deliveryNeedsRetry({ key: 'k', status: 'unknown' }, nowMs)) throw new Error('没有 messageId 不该重试')
+    const st = emptyState('r')
+    const row = markDelivery(st, { ...base, text: '正文' }, 'sending', null)
+    if (row.attempts !== 1 || row.text !== '正文') throw new Error('sending 应记尝试与正文')
+    markDelivery(st, { ...base }, 'sent', null)
+    const again = markDelivery(st, { ...base }, 'sending', null)
+    if (again.attempts !== 2 || again.messageId !== 'm1') throw new Error('重试应复用 messageId 并累加尝试')
+    return 'sending/unknown/sent/consumed 8 种组合，重试复用同一 messageId'
+  })
+
+  check('交付门禁逐条可拒、复核不可伪造、产物变了旧复核失效', () => {
+    const dir = join(tmpdir(), `cn-gate-${randomUUID()}`)
     try {
-      recordVerification(project, { taskId: 't1', reviewer: 'backend-engineer', verdict: 'pass', evidence: 'x' })
-    } catch (error) {
-      thrown = errorMessage(error)
+      mkdirSync(dir, { recursive: true })
+      const artifact = join(dir, 'out.glb')
+      writeFileSync(artifact, 'glTF-v1', 'utf8')
+      const state = emptyState('session-2')
+      const project = openProject(state, { objective: '门禁', acceptance: ['验收一'] })
+      let blockers = deliverBlockers(project, state)
+      assert(blockers.some((row) => row.includes('没有任何任务')), '没有任务时门禁没拦住')
+      assert(blockers.some((row) => row.includes('缺证据')), '验收缺证据时门禁没拦住')
+      const task = upsertTask(project, { id: 't1', title: 'x', owner: 'backend-engineer', ownerSessionId: 'session-owner', status: 'in_progress', artifacts: [artifact] })
+      refreshArtifacts(project)
+      assert(String(task.artifactStamp).startsWith('sha256:'), `产物版本没按内容算：${task.artifactStamp}`)
+      assert(deliverBlockers(project, state).some((row) => row.includes('未通过复核')), '未复核就允许交付')
+      const rej = (fn) => {
+        try { fn(); return '' } catch (error) { return errorMessage(error) }
+      }
+      const stamp = task.artifactStamp
+      const ok = { taskId: 't1', reviewer: 'code-quality-reviewer', verdict: 'pass', evidence: '真实跑过', artifactStamp: stamp, source: 'team-tool', reviewerSessionId: 'session-rev', callId: 'call-1' }
+      assert(rej(() => recordVerification(project, { ...ok, taskId: 't9' })) === 'unknown-task', '未知任务没有被拦住')
+      assert(rej(() => recordVerification(project, { ...ok, reviewer: 'backend-engineer' })) === 'reviewer-cannot-be-owner', '自证没有被拦住')
+      assert(rej(() => recordVerification(project, { ...ok, reviewer: '' })) === 'reviewer-required', '空复核者没有被拦住')
+      assert(rej(() => recordVerification(project, { ...ok, verdict: 'ok' })) === 'verdict-invalid:ok', '非法 verdict 没有被拦住')
+      assert(rej(() => recordVerification(project, { ...ok, source: undefined })) === 'reviewer-provenance-required', '缺少调用来源没有被拦住')
+      assert(rej(() => recordVerification(project, { ...ok, reviewerSessionId: 'session-owner' })) === 'reviewer-cannot-be-owner', '复核者与执行者同会话没有被拦住')
+      assert(rej(() => recordVerification(project, { ...ok, artifactStamp: '' })) === 'artifact-stamp-required', '缺版本没有被拦住')
+      assert(rej(() => recordVerification(project, { ...ok, artifactStamp: 'sha256:stale' })).startsWith('stale-artifact-stamp'), '旧版本没有被拦住')
+      assert(rej(() => recordVerification(project, { ...ok, evidence: '  ' })) === 'evidence-required', '空证据没有被拦住')
+      recordVerification(project, ok)
+      const record = project.tasks.find((row) => row.id === 't1').verification
+      assert(record.verdict === 'pass' && record.reviewerSessionId === 'session-rev' && record.callId === 'call-1', '复核来源没有记进记录')
+      blockers = deliverBlockers(project, state)
+      assert(blockers.length === 1 && blockers[0].includes('缺证据'), `复核过后应只剩验收缺证据，实际：${blockers.join('；')}`)
+      project.acceptance[0].evidence = '导出文件 123 B'
+      assert(deliverBlockers(project, state).length === 0, `验收证据补齐后门禁仍拦：${deliverBlockers(project, state).join('；')}`)
+      writeFileSync(artifact, 'glTF-v2-内容变了', 'utf8')
+      refreshArtifacts(project)
+      const after = project.tasks.find((row) => row.id === 't1')
+      assert(after.artifactStamp !== stamp, '同路径改内容后产物版本没变')
+      assert(after.status === 'rework', `产物变了任务状态没退回返工：${after.status}`)
+      const stale = deliverBlockers(project, state)
+      assert(stale.some((row) => row.includes('未通过复核') || row.includes('复核早于当前产物')), `产物变了旧复核没有失效：${stale.join('；')}`)
+      return '未知任务 / 自证 / 空复核者 / 非法 verdict / 缺来源 / 同会话 / 缺版本 / 旧版本 / 空证据 / 产物变更，十种都拦住'
+    } finally {
+      try { rmSync(dir, { recursive: true, force: true }) } catch {}
     }
-    assert(thrown === 'reviewer-cannot-be-owner', `自证没有被拦住：${thrown || '（没有报错）'}`)
-    recordVerification(project, { taskId: 't1', reviewer: 'code-quality-reviewer', verdict: 'pass', evidence: '真实跑过' })
-    assert(stageOfTask(task, project).stage === 'review', '复核通过后没有进入内部复核阶段')
-    assert(stageOfTask(task, project).waitingOn === 'user', '复核通过后没有标成等待用户')
-    addQuestion(project, { taskId: 't1', kind: 'business', question: '缺口径', impact: '阻塞' })
-    task.verification = null
-    assert(stageOfTask(task, project).stage === 'needs-user', '有待用户问题时没有映射到 needs-user')
-    return 'working → review → needs-user 三段都按真实记录判定；自证被拒绝'
   })
-
   for (const result of results) {
     const tag = result.state === 'ok' ? 'ok  ' : result.state === 'skip' ? 'skip' : 'FAIL'
     console.log(`${tag} ${result.label}${result.detail ? ` — ${result.detail}` : ''}`)

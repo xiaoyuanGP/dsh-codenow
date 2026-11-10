@@ -106,6 +106,18 @@ window.__ModuleLoader__.load({
         cursor: 'pointer',
         fontFamily: 'inherit',
       },
+      select: {
+        appearance: 'none',
+        boxSizing: 'border-box',
+        border: `1px solid ${EDGE}`,
+        background: SOFT,
+        color: 'inherit',
+        borderRadius: 8,
+        padding: '3px 6px',
+        fontSize: 11.5,
+        fontFamily: 'inherit',
+        cursor: 'pointer',
+      },
       input: {
         appearance: 'none',
         boxSizing: 'border-box',
@@ -1262,25 +1274,34 @@ window.__ModuleLoader__.load({
       const [loading, setLoading] = useState(false)
       // 刷新成功后自增，透传给群聊/任务页签：它们的 effect 依赖 tick 重跑同一份请求，切页签不再是旧数据。
       const [tick, setTick] = useState(0)
+      const requestRef = useRef(0)
+      const pickSession = useCallback((id) => {
+        requestRef.current += 1
+        setSessionId(id)
+        setState((current) => current ? { ...current, autonomy: null } : current)
+      }, [])
 
       const refresh = useCallback(() => {
+        const request = ++requestRef.current
         setLoading(true)
         setError('')
-        callRpc('state', {}).then((result) => {
+        return callRpc('state', { sessionId }).then((result) => {
+          if (request !== requestRef.current) return
           setLoading(false)
           if (result?.ok) {
             const value = result.value ?? {}
             setState(value)
-            setSessionId((current) => current || value.sessions?.[0]?.id || '')
+            if (!sessionId && value.sessions?.[0]?.id) pickSession(value.sessions[0].id)
             setTick((current) => current + 1)
           } else {
             setError(result?.error?.message ?? '读取失败')
           }
         }).catch((err) => {
+          if (request !== requestRef.current) return
           setLoading(false)
           setError(String(err?.message ?? err) || '无法连接插件')
         })
-      }, [])
+      }, [sessionId, pickSession])
 
       // 环境：只读检测 + 用户点一次才装。装完立刻重读状态，不做乐观更新（避免界面说装好了其实没装）。
       const [env, setEnv] = useState(null)
@@ -1322,13 +1343,15 @@ window.__ModuleLoader__.load({
 
       useEffect(() => {
         refresh()
-        loadEnv()
-      }, [refresh, loadEnv])
+        const timer = setInterval(() => { if (document.visibilityState !== 'hidden') refresh() }, 8000)
+        return () => { requestRef.current += 1; clearInterval(timer) }
+      }, [refresh])
+      useEffect(() => { loadEnv() }, [loadEnv])
 
       // 只是一次条件分派：元素每次 render 都会重建，套记忆化没有收益。
       let content = h(TeamTab, { state })
-      if (tab === 'chat') content = h(ChatTab, { state, sessionId, onPick: setSessionId, tick })
-      else if (tab === 'tasks') content = h(TasksTab, { state, sessionId, onPick: setSessionId, tick })
+      if (tab === 'chat') content = h(ChatTab, { state, sessionId, onPick: pickSession, tick })
+      else if (tab === 'tasks') content = h(TasksTab, { state, sessionId, onPick: pickSession, tick })
       else if (tab === 'cache') content = h(CacheTab, { state })
       else if (tab === 'usage') content = h(UsageTab, { state })
 
@@ -1351,6 +1374,10 @@ window.__ModuleLoader__.load({
             h('div', { style: S.subtitle }, summary)
           ),
           h('div', { style: S.spacer }),
+          h('select', { value: sessionId, onChange: (event) => pickSession(event.target.value), 'aria-label': '项目所属会话', style: { ...S.select, maxWidth: 280 } },
+            !sessionId ? h('option', { value: '' }, '选择会话') : null,
+            sessionId && !(state?.sessions ?? []).some((row) => row.id === sessionId) ? h('option', { value: sessionId }, shortSession(sessionId)) : null,
+            (state?.sessions ?? []).map((row) => h('option', { key: row.id, value: row.id }, sessionLabel(row)))),
           h('button', { style: S.btn, onClick: refresh, disabled: loading, 'aria-busy': loading }, loading ? '刷新中…' : '刷新')
         ),
         h(
@@ -1394,20 +1421,23 @@ window.__ModuleLoader__.load({
         (() => {
           // 项目级状态：只有真需要用户动作时才高亮，内部复核/进行中不打扰用户。
           const auto = state?.autonomy
-          if (!auto || (!auto.project && !auto.stopped)) return null
+          if (!auto) return null
+          if (auto.problem || auto.reconciliationProblem) return h('div', { style: { ...S.envBar, ...S.envMissing } }, `项目状态暂不可用：${auto.problem || auto.reconciliationProblem}`)
+          if (!auto.project && !auto.stopped) return null
           const project = auto.project
           const tasks = project?.tasks ?? []
           const open = (project?.questions ?? []).filter((row) => !row.answeredAt)
-          const review = tasks.filter((row) => row.verification?.verdict === 'pass')
+          const verified = tasks.filter((row) => row.status === 'verified' && row.verification?.verdict === 'pass' && row.verification.artifactStamp === row.artifactStamp)
           const working = tasks.filter((row) => row.status === 'in_progress')
           const head = auto.stopped
             ? `自动接续已停止（${auto.stopped.reason || '无原因'}）· 需要用户明确说恢复`
-            : `目标：${project.objective}`
+            : `${project.deliveredAt ? '已交付' : '目标'}：${project.objective}`
           const tail = project
             ? [
-                `任务 ${tasks.length}（进行中 ${working.length} / 待复核 ${review.length}）`,
+                `任务 ${tasks.length}（进行中 ${working.length} / 已复核 ${verified.length}）`,
                 open.length > 0 ? `需要你处理 ${open.length} 项：${open[0].question}` : '',
-                project.nextAction ? `下一步：${project.nextAction}` : '',
+                !project.deliveredAt && project.nextAction ? `下一步：${project.nextAction}` : '',
+                auto.deliveries?.unresolved?.length ? `接续待核对 ${auto.deliveries.unresolved.length} 条` : '',
               ]
                 .filter(Boolean)
                 .join(' · ')

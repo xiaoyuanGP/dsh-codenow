@@ -1,6 +1,6 @@
 {
   "name": "dsh-codenow",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "多角色 AI 协同工作台：17 个岗位模板、群聊回放、团队任务与各 agent 用量/缓存，并把编排能力作为 codenow 工具交给 Lead；内置 Blender 建模用的技能、MCP 桥与 addon。",
   "icon": "icon.svg",
@@ -13,6 +13,7 @@
   "files": [
     "index.js",
     "client.js",
+    "lib/",
     "cordis.patch.yml",
     "icon.svg",
     "bin/",
