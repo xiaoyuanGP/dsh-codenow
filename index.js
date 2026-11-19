@@ -459,6 +459,56 @@ const projectionCache = new Map()
  * 标题与模型名同出一份 projcache 投影（模型名不在 rows.model 上，在 modelSelection / costUsage 里），
  * 一次读盘一次解析；按 mtime 判新旧，重复轮询（live 每 4s）不再重复解析几 MB JSON。
  */
+/**
+ * 投影结构从 v1 一路改到 v7，字段还可能继续变（rc.5 起按版本号演进）。
+ * 这里只认两件事：先试 `record.rows.*.val`（v7+），再退回顶层同名字段（旧版），
+ * 版本号本身不参与判断——只认形状，未来加版本也不会读不到标题。
+ */
+function projectionValue(raw) {
+  const record = raw?.record ?? raw ?? {}
+  const rows = record?.rows && typeof record.rows === 'object' ? record.rows : {}
+  const pick = (...candidates) => {
+    for (const candidate of candidates) {
+      if (typeof candidate === 'string' && candidate !== '') return candidate
+    }
+    return ''
+  }
+  const title = pick(rows?.title?.val, rows?.title, record?.title)
+  const model = pick(
+    rows?.modelSelection?.val?.lastUsed?.model,
+    rows?.modelSelection?.val?.model,
+    rows?.model?.val,
+    rows?.model,
+    rows?.costUsage?.val?.model,
+    record?.model,
+  )
+  return { title: String(title), model: String(model) }
+}
+
+/**
+ * 宿主能力快照：rc 版本之间服务会改名/删方法，插件不能等崩了才发现。
+ * 只读、无副作用；启动时打一行日志，也经 setup 端点暴露给面板。
+ */
+function hostCapabilities() {
+  const teams = TEAM_CTX?.agentTeams
+  const agents = TEAM_CTX?.agents
+  const probe = []
+  if (!TEAM_CTX) probe.push('team-services')
+  if (typeof teams?.isEnabled !== 'function') probe.push('agentTeams.isEnabled')
+  if (typeof agents?.list !== 'function') probe.push('agents.list')
+  return {
+    services: { teamCtx: Boolean(TEAM_CTX), webServer: true, tools: true, systemPrompt: true },
+    teams: {
+      isEnabled: typeof teams?.isEnabled === 'function',
+      tryMembership: typeof teams?.tryMembership === 'function',
+      listMembers: typeof teams?.listMembers === 'function',
+      createTask: typeof teams?.createTask === 'function',
+    },
+    agents: { list: typeof agents?.list === 'function' },
+    missing: probe,
+  }
+}
+
 function readProjection(sessionId) {
   const candidates = projectionCandidates(sessionId)
   if (candidates.length === 0) return { title: '', model: '' }
@@ -483,11 +533,8 @@ function readProjection(sessionId) {
   if (cached && cached.stamp === stamp) return cached.value
   let value = { title: '', model: '' }
   try {
-    const rows = JSON.parse(readFileSync(file, 'utf8'))?.record?.rows ?? {}
-    value = {
-      title: String(rows?.title?.val ?? ''),
-      model: String(rows?.modelSelection?.val?.lastUsed?.model ?? rows?.costUsage?.val?.model ?? ''),
-    }
+    // 版本无关：只认形状（rows.*.val 优先，旧版顶层字段兜底）
+    value = projectionValue(JSON.parse(readFileSync(file, 'utf8')))
   } catch {
     // 半写/损坏：按「无标题无模型」返回，UI 会显示为空。
   }
@@ -496,6 +543,153 @@ function readProjection(sessionId) {
   // 把整个缓存清空再全量重解析（实测 64 个 projcache 重解析 185ms），退化成每次都冷启动。
   if (projectionCache.size > 96) projectionCache.delete(projectionCache.keys().next().value)
   return value
+}
+
+/**
+ * 子会话的岗位名在**父会话**投影里（subagentCatalog.label），子会话自己是 subagent/descriptor。
+ * 只解一份 JSON 的一部分，按 stamp 缓存，别为了一次取名把几 MB 投影反复解析。
+ */
+const catalogCache = new Map()
+
+function readSubagentLabel(rootId, childId) {
+  const root = normalizeSessionId(rootId)
+  const child = normalizeSessionId(childId)
+  if (!root || !child) return ''
+  for (const name of projectionCandidates(root)) {
+    const file = join(DSH_HOME, 'storages', 'session_projcache', 'sessions', `${name}.json`)
+    let stamp = ''
+    try {
+      const info = statSync(file)
+      stamp = `${info.mtimeMs}:${info.size}`
+      const cached = catalogCache.get(root)
+      if (cached && cached.stamp === stamp) return cached.labels.get(child) ?? ''
+      const rows = JSON.parse(readFileSync(file, 'utf8'))?.record?.rows ?? {}
+      const values = rows?.subagentCatalog?.val?.head?.values ?? []
+      const labels = new Map()
+      for (const row of Array.isArray(values) ? values : []) {
+        const id = normalizeSessionId(row?.childId)
+        if (id && row?.label) labels.set(id, String(row.label))
+      }
+      catalogCache.set(root, { stamp, labels })
+      if (catalogCache.size > 64) catalogCache.delete(catalogCache.keys().next().value)
+      return labels.get(child) ?? ''
+    } catch {
+      // 这个命名不存在，试下一个
+    }
+  }
+  return ''
+}
+
+/**
+ * 团队身份：新宿主的 Team 成员就是 subagent，`agentTeams.membership/tryMembership/listMembers`
+ * 已整体移除（服务只剩 isEnabled/createTask/getTask/listTasks/updateTask），所以身份改由磁盘判据得出：
+ * 会话 header 有 parentSession = teammate（名字取父会话投影里的 subagentCatalog.label），没有 = lead。
+ * 旧宿主仍先试 tryMembership，取到就用 —— 两代宿主同一份代码都能跑。
+ */
+const memberCache = new Map()
+const MEMBER_TTL_MS = 5000
+
+// 团队协作开关读投影里的 agentTeam 行；只有开关被显式写过才有布尔值。
+const teamModeCache = new Map()
+
+function readTeamEnabled(rootId) {
+  const root = normalizeSessionId(rootId)
+  if (!root) return null
+  for (const name of projectionCandidates(root)) {
+    const file = join(DSH_HOME, 'storages', 'session_projcache', 'sessions', `${name}.json`)
+    try {
+      const info = statSync(file)
+      const stamp = `${info.mtimeMs}:${info.size}`
+      const cached = teamModeCache.get(root)
+      if (cached && cached.stamp === stamp) return cached.enabled
+      const rows = JSON.parse(readFileSync(file, 'utf8'))?.record?.rows ?? {}
+      const value = rows?.agentTeam?.val?.enabled
+      const enabled = typeof value === 'boolean' ? value : null
+      teamModeCache.set(root, { stamp, enabled })
+      if (teamModeCache.size > 128) teamModeCache.delete(teamModeCache.keys().next().value)
+      return enabled
+    } catch {
+      // 这个命名不存在，试下一个
+    }
+  }
+  return null
+}
+
+/**
+ * 团队协作开关的真实取值：宿主服务优先（同步），退回投影，两边都读不到就算关闭。
+ * 读不到时按关闭处理——宁可少强制，也不要凭猜测要求模型必须派活。
+ */
+function teamModeEnabled(agent) {
+  try {
+    const value = TEAM_CTX?.agentTeams?.isEnabled?.(agent)
+    if (typeof value === 'boolean') return { enabled: value, source: 'service' }
+  } catch {
+    // 旧宿主没有 isEnabled，或传进来的不是活 agent
+  }
+  const sessionId = normalizeSessionId(agent?.session?.id ?? agent?.sessionId ?? agent?.id ?? '')
+  const flagged = sessionId ? readTeamEnabled(rootOf(sessionId) || sessionId) : null
+  if (typeof flagged === 'boolean') return { enabled: flagged, source: 'projection' }
+  return { enabled: false, source: 'unknown' }
+}
+
+function memberOfAgent(agent) {
+  const sessionId = rootOf(agent?.session?.id ?? agent?.sessionId ?? agent?.id ?? '')
+  if (!sessionId) return null
+  const fresh = memberCache.get(sessionId)
+  if (fresh && Date.now() - fresh.at < MEMBER_TTL_MS) return fresh.value
+  let value = null
+  try {
+    const legacy = TEAM_CTX?.agentTeams?.tryMembership?.(agent)
+    if (legacy?.role) {
+      value = {
+        role: String(legacy.role),
+        name: String(legacy.name ?? ''),
+        rootSessionId: rootOf(legacy.root?.id) || sessionId,
+        source: 'membership',
+        agent,
+      }
+    }
+  } catch {
+    value = null
+  }
+  if (!value) {
+    const row = findSession(sessionId)
+    let parent = rootOf(agent?.session?.header?.parentSession ?? '')
+    if (!parent && row?.file) {
+      try {
+        parent = rootOf(readSessionHead(row.file)?.parentSession ?? '')
+      } catch {
+        parent = ''
+      }
+    }
+    if (parent) {
+      value = { role: 'teammate', name: readSubagentLabel(parent, sessionId), rootSessionId: parent, source: 'disk', agent }
+    } else if (row) {
+      value = { role: 'lead', name: 'lead', rootSessionId: sessionId, source: 'disk', agent }
+    } else {
+      // 磁盘上根本没有这个会话，也没有 membership 记录：身份未知，不猜成 lead（否则陌生人拿 Lead 权限）。
+      value = null
+    }
+  }
+  memberCache.set(sessionId, { at: Date.now(), value })
+  if (memberCache.size > 128) memberCache.delete(memberCache.keys().next().value)
+  return value
+}
+
+/** 某个父会话名下、确实挂在它下面的子会话记录（替代已移除的 listMembers）。 */
+function memberRecordOf(rootSessionId, childSessionId) {
+  const child = rootOf(childSessionId)
+  if (!child) return null
+  const row = findSession(child)
+  if (!row?.file) return null
+  let parent = ''
+  try {
+    parent = rootOf(readSessionHead(row.file)?.parentSession ?? '')
+  } catch {
+    return null
+  }
+  if (parent !== rootOf(rootSessionId)) return null
+  return { id: child, name: readSubagentLabel(rootSessionId, child), role: 'teammate' }
 }
 
 /**
@@ -741,8 +935,7 @@ function toMessages(events, limit) {
   return limit > 0 ? messages.slice(-limit) : messages
 }
 
-const COORDINATION_TOOLS =
-  /^(team_task_create|team_task_get|team_task_update|team_task_list|spawn_teammate|send_message|wait_agent|list_agents)$/
+const COORDINATION_TOOLS = /^(team_task_create|team_task_get|team_task_update|team_task_list|spawn_teammate|subagent|subagent_fork|send_message|wait_agent|interrupt_agent|list_agents)$/
 
 /**
  * 任务「现在卡在谁身上」。只吃结构化字段：宿主 `team/task` 的 status / blockedBy / 事件时间，
@@ -853,7 +1046,7 @@ function toCoordination(events) {
       summary: String(args.subject ?? args.description ?? args.message ?? '').slice(0, 240),
     }
     actions.push(action)
-    if (toolName === 'spawn_teammate') {
+    if (toolName === 'spawn_teammate' || toolName === 'subagent' || toolName === 'subagent_fork') {
       const name = String(args.name ?? '')
       if (name && !teammates.has(name)) {
         teammates.set(name, { name, description: String(args.description ?? ''), phase: '', at: event.time })
@@ -1569,17 +1762,10 @@ function livePayload(sessionId) {
       const parent = agent?.session?.header?.parentSession ?? null
       const title = agent?.title ?? agent?.session?.title ?? (id ? readProjection(id).title : '') ?? null
       // membership().name 才是 spawn 时定的岗位 id；title 只是会话标题，不可靠。
-      let memberName = ''
-      let memberRoot = ''
-      let memberRole = ''
-      try {
-        const m = TEAM_CTX.agentTeams.membership(agent)
-        memberName = m?.name ?? ''
-        memberRoot = m?.root?.id ?? ''
-        memberRole = m?.role ?? ''
-      } catch {
-        memberName = ''
-      }
+      const member = memberOfAgent(agent)
+      const memberName = member?.name ?? ''
+      const memberRoot = member?.rootSessionId ?? ''
+      const memberRole = member?.role ?? ''
       const label = roleLabelOf(memberName) || roleLabelOf(title) || null
       if (!memberName) unresolved.push({ id, title: title || null })
       return {
@@ -1609,13 +1795,13 @@ const CODENOW_POLICY = [
   '',
   '本会话搭载 codenow 岗位矩阵：你 + 16 位专家工程师。**你是 Lead 时**你就是首席工程师，对技术决策和交付闭环负责；新任务开始时先用 `codenow({action:"role",id:"chief-engineer"})` 读取首席岗位全文，同一任务复用已读内容、模板变化后重新读取。岗位规范不能覆盖用户要求或宿主审批。',
   '',
-  '**派活**：先判断这活该谁做——小改动、单文件、纯查询可以自己做完并写明理由；涉及跨领域、需要独立验证或独立视角时派给对应岗位。**允许零个 teammate**，决定派人之后再按规模选人数：默认 1 个、跨领域 2 个、最多 3 个；禁止把 16 个依次拉起，禁止为「显得在协同」而全量 spawn。用户本轮明说「不用子智能体」「你自己做」「别派人」时遵从用户并写明理由。说派了却没有真实调用＝假报进度；子智能体在跑时不要自己重复做它的活。',
+  '**派活（默认必须）**：新任务默认至少派 1 个岗位并行推进；只有单文件小改、纯查询或用户明说不用子智能体时才单干，并在回复里写明理由。用本会话**实际提供**的派活工具——`subagent`（或 `subagent_fork`）；宿主要是另有 `spawn_teammate` 才用它。按规模选 1-3 个（跨领域 2、需独立验证 2-3），**一次把上下文给全、并行开出**，不要派一个等一个；禁止把全部岗位依次拉起，禁止为「显得在协同」而全量 spawn。进度优先：等待子智能体时自己推进不冲突的部分；说派了却没有真实调用＝假报进度；子智能体在跑时不要自己重复做它的活。',
   '',
   '路由：UI/样式/交互/a11y→`frontend-design-engineer`；服务端/接口/业务/异步→`backend-engineer`；移动端/跨端→`mobile-client-engineer`；表结构/索引/迁移→`database-engineer`；数据清洗/指标/算法→`data-algorithm-engineer`；测试/缺陷复现→`test-engineer`；代码审查/质量门禁→`code-quality-reviewer`；构建/部署/环境→`devops-sre-engineer`；鉴权/加密/依赖漏洞→`security-engineer`；架构/模块边界/选型→`system-architect`；文档/README→`technical-writer`；PPT/演示/汇报材料→`pptx-engineer`；Word 长文档/样式与模板→`docx-engineer`；Excel/表格/数据透视→`xlsx-engineer`；GitHub 仓库/开源协作/发布→`github-repo-manager`；Blender 建模/3D 资产/引擎导出→`modeling-engineer`。',
   '',
-  '**断线必须恢复**：子智能体断掉（工具连错、send_message 被拒、wait_agent 无进展、会话报错、从名册消失）不许丢活：① 先 `send_message` 唤醒；② 唤不醒或已不在名册，才新建一个——用新的唯一 name（同岗位第二次起 `<role-id>-2`、`-3`…），把已完成部分与原任务一起写进 prompt；同队 name 终身不可复用，累计创建上限以宿主实际配置为准，停止成员不代表释放名额；③ 同岗位连败 2 次，换邻岗或自己做完，并在汇总写明。派活时交代「做到哪步、产出放哪」。',
+  '**断线必须恢复**：子智能体断掉（工具连错、`send_message` 被拒、`wait_agent` 无进展、会话报错）不许丢活：① 先 `send_message` 唤醒并补齐上下文；② 唤不醒就新建一个——`subagent` 的 name 重名时宿主会自动加后缀（`-2`、`-3`…），把已完成部分与原任务一起写进 prompt；③ 同岗位连败 2 次，换邻岗或自己做完，并在汇总写明。派活时交代「做到哪步、产出放哪」。',
   '',
-  '写法：`spawn_teammate({name:"<role-id>", description:"<岗位名>", prompt:"<岗位全文+目标+验收标准>"})`，岗位全文用 `codenow({action:"role", id:"<role-id>"})` 取（已含分析与实施公共规范，prompt 里不用重复贴）；`name` 必须匹配 `^[a-z0-9]+(?:-[a-z0-9]+)*$`（小写字母数字与连字符，重名会直接失败），首次用角色 id 原文，**不要** spawn `chief-engineer`。任务用 `team_task_create`，回报用 `send_message`。',
+  '写法：`subagent({name:"<role-id>", description:"<岗位名>", prompt:"<岗位全文+目标+验收标准+可改范围>", cwd:"<可选>"})`；只有需要继承当前对话上下文时才用 `subagent_fork`。子智能体是 fresh context，prompt 必须自带全部背景，不要写「如上所述」。岗位全文用 `codenow({action:"role", id:"<role-id>"})` 取（已含公共规范，prompt 里不用重复贴）。要并行就一次发多个调用；等结果用 `wait_agent`，追问或补料用 `send_message`。若宿主另提供 `spawn_teammate`，再配合 `team_task_create` 登记任务。',
   '',
   '派工五要素（缺一项接手人就得重新调查）：目标与验收、真实输入来源／已完成的调查与成果／可改文件与不能破坏的不变量／前置依赖、交付对象、阻塞解除／交付时要给的验证证据。',
   '',
@@ -1625,6 +1811,16 @@ const CODENOW_POLICY = [
   '',
    '**自主推进（项目级）**：用户给一次明确需求后，调查→计划→分派→复核→返工→集成连续做完，不要求逐批确认。用 `codenow({action:"project",project:{op:"status"}})` 恢复检查点；`open` 记录目标/验收/范围（同目标重试复用项目），`task` 记录实际成员 name、childSessionId、依赖及文件产物，`next` 保存下一步。复核派给独立 teammate：让它先读 status 核对当前 artifactStamp、实际文件，再亲自调用 `verify`，Lead 不得代录。`deliver` 会重读文件哈希；文件变更必须重验。`ask` 只记录缺少且无法查到的业务定义、凭据或授权，带 taskId 只阻塞该任务及后继，集中一次询问并继续其他任务；收到真实回答才 `answer`。内部复核通过后继续集成，不等用户说继续。**stop 后必须等用户明确要求才 resume**。接续仅以真实入箱和日志对账为准，端点失败、成员额度不足或独立复核缺失如实记录；不要重复已完成的副作用。',
 ].join('\n')
+
+// 派活强度跟随新版 DSH 的「团队协作」开关：开了必须派人，关了只按需。
+// 只有这一段随开关变，其余文本两种取值逐字相同。
+const DISPATCH_PARAGRAPH = /^\*\*派活（默认必须）\*\*.*$/mu
+const DISPATCH_ON = '**派活（强制）**：团队协作开关已打开——新任务**必须**至少派 1 个子智能体并行推进，不许自己一个人做完；只有用户本轮明确说不用子智能体才可例外，并在回复里写明理由。用 `subagent`（或 `subagent_fork`）；宿主要是另有 `spawn_teammate` 才用它。按规模选 1-3 个（跨领域 2、需独立验证 2-3），**一次把上下文给全、并行开出**，不要派一个等一个；禁止把全部岗位依次拉起，禁止为「显得在协同」而全量 spawn。进度优先：等待子智能体时自己推进不冲突的部分；说派了却没有真实调用＝假报进度；子智能体在跑时不要自己重复做它的活。'
+const DISPATCH_OFF = '**派活（按需）**：团队协作开关未打开——允许零个 teammate：小改动、单文件、纯查询可以自己做完并写明理由；涉及跨领域、需要独立验证或独立视角时再派。用 `subagent`（或 `subagent_fork`）；宿主要是另有 `spawn_teammate` 才用它。要派就按规模选 1-3 个（跨领域 2、需独立验证 2-3），**一次把上下文给全、并行开出**，不要派一个等一个；禁止把全部岗位依次拉起，禁止为「显得在协同」而全量 spawn。进度优先：等待子智能体时自己推进不冲突的部分；说派了却没有真实调用＝假报进度；子智能体在跑时不要自己重复做它的活。'
+
+function policyText(enabled) {
+  return CODENOW_POLICY.replace(DISPATCH_PARAGRAPH, enabled === true ? DISPATCH_ON : DISPATCH_OFF)
+}
 
 /**
  * 子智能体的语言段：宿主全局分段对每个 agent 都生效，这里只在 role === 'teammate' 时返回。
@@ -1640,9 +1836,9 @@ const TEAMMATE_LANGUAGE = [
 ].join('\n')
 
 /** 语言分段按身份分流：纯函数，方便自检直接断言四个分支。 */
-function sectionTextForMembership(membership) {
+function sectionTextForMembership(membership, enabled) {
   if (!membership) return ''
-  if (membership.role === 'lead') return CODENOW_POLICY
+  if (membership.role === 'lead') return policyText(enabled)
   if (membership.role === 'teammate') return TEAMMATE_LANGUAGE
   return ''
 }
@@ -1779,6 +1975,8 @@ function mcpEntry() {
 
 // 只读：告诉面板"缺什么"，不改任何东西（Q3：装不装由用户点）。
 function setupStatus() {
+  // 宿主能力跟着一起吐，面板能直接看出当前 rc 缺了什么。
+  const host = hostCapabilities()
   const entry = mcpEntry()
   return {
     skills: {
@@ -1799,6 +1997,7 @@ function setupStatus() {
       addons: blenderAddonDirs().map((row) => row.version),
       bundled: existsSync(join(BUNDLED_ADDON, '__init__.py')),
     },
+    host,
   }
 }
 
@@ -1890,20 +2089,16 @@ function callerOf(exec) {
   const sessionId = rootOf(exec?.agent?.session?.id)
   if (!sessionId) return { ok: false, reason: 'no-session-id' }
   const agent = exec?.agent ?? null
-  let membership = null
-  try {
-    membership = TEAM_CTX?.agentTeams?.tryMembership?.(agent) ?? null
-  } catch {
-    membership = null
-  }
-  const rootSessionId = rootOf(membership?.root?.id)
+  // 新宿主没有 membership API，身份由 memberOfAgent 走磁盘判据得出（旧宿主仍优先用 membership）。
+  const membership = memberOfAgent(agent)
+  const rootSessionId = rootOf(membership?.rootSessionId)
   if (!membership || !rootSessionId) return { ok: false, reason: 'no-team-membership' }
   // 工作目录按可信度降级：服务给出的 committed 目录 > 会话 header 记录的 cwd > 未知。
   // 都不猜：拿不到就交 null，让需要它的产物校验自己报「缺少项目实际工作目录」。
   let cwd = null
   let cwdSource = 'unknown'
   try {
-    const fromService = agent.ctx?.get?.('workingDirectory')?.get?.(membership.root.session) ?? null
+    const fromService = agent.ctx?.get?.('workingDirectory')?.get?.(rootSessionId) ?? null
     if (fromService) { cwd = String(fromService); cwdSource = 'working-directory-service' }
   } catch {}
   if (!cwd) {
@@ -2009,7 +2204,8 @@ async function projectOp(input, caller) {
         if (clearing) {
           fields.childSessionId = null
         } else if (childId) {
-          const member = TEAM_CTX.agentTeams.listMembers(caller.agent).find((row) => rootOf(row.id) === rootOf(childId) && row.role === 'teammate')
+          // 新宿主没有 listMembers：按「该子会话的 header.parentSession 是否就是本项目根会话」判定归属。
+          const member = memberRecordOf(caller.rootSessionId, childId)
           if (!member) throw new Error('child-not-in-team')
           if (fields.owner && fields.owner !== member.name) throw new Error('owner-must-match-team-name')
           fields.owner = member.name
@@ -2099,7 +2295,7 @@ function liveLeadAgents() {
   }
   return list.filter((agent) => {
     try {
-      return TEAM_CTX.agentTeams?.tryMembership?.(agent)?.role === 'lead' && typeof agent?.followup === 'function'
+      return memberOfAgent(agent)?.role === 'lead' && typeof agent?.followup === 'function'
     } catch {
       return false
     }
@@ -2435,6 +2631,8 @@ export async function apply(ctx) {
     ctx.inject(['agents', 'agentTeams'], (teamCtx) => {
       TEAM_CTX = teamCtx
       trace('team services ready')
+      const caps = hostCapabilities()
+      trace('host caps teams.isEnabled=' + (caps.teams.isEnabled ? 1 : 0) + ' tryMembership=' + (caps.teams.tryMembership ? 1 : 0) + ' listMembers=' + (caps.teams.listMembers ? 1 : 0) + ' missing=' + (caps.missing.join(',') || '-'))
     })
   } catch (error) {
     trace(`team inject FAILED: ${error?.stack ?? error}`)
@@ -2467,7 +2665,7 @@ export async function apply(ctx) {
               const agent = context?.agent
               if (agent === undefined || agent === null) return ''
               try {
-                return sectionTextForMembership(TEAM_CTX?.agentTeams?.tryMembership?.(agent))
+                return sectionTextForMembership(memberOfAgent(agent), teamModeEnabled(agent).enabled)
               } catch (error) {
                 trace(`policy membership FAILED: ${errorMessage(error)}`)
                 return ''
@@ -2818,11 +3016,11 @@ function selfCheck() {
   })
 
   check('语言分段按身份分流（Lead 中文 / teammate 英文 / 其余不注入）', () => {
-    const lead = sectionTextForMembership({ role: 'lead' })
+    const lead = sectionTextForMembership({ role: 'lead' }, false)
     const mate = sectionTextForMembership({ role: 'teammate' })
     const none = sectionTextForMembership(undefined)
     const other = sectionTextForMembership({ role: 'spectator' })
-    assert(lead === CODENOW_POLICY && lead.includes('简体中文'), 'Lead 分支没有拿到中文策略或缺少语言条款')
+    assert(lead === policyText(false) && lead.includes('简体中文'), 'Lead 分支没有拿到中文策略或缺少语言条款')
     assert(mate === TEAMMATE_LANGUAGE, 'teammate 分支没有拿到英文语言段')
     // 英文段里混进中文就等于给子智能体发了两条相反指令，用纯 ASCII 把它钉死。
     // eslint-disable-next-line no-control-regex
@@ -2831,6 +3029,39 @@ function selfCheck() {
     assert(mate.includes('This overrides any other language instruction'), 'teammate 语言段没有声明覆盖预设的中文要求')
     assert(none === '' && other === '', '非本队身份不该被注入语言段')
     return `Lead ${lead.length} 字符（中文）/ teammate ${mate.length} 字符（纯 ASCII）/ 无身份与其它角色均不注入`
+  })
+
+  check('派活强度跟随团队协作开关（开=强制 / 关=按需）', () => {
+    const on = policyText(true)
+    const off = policyText(false)
+    assert(sectionTextForMembership({ role: 'lead' }, true) === on, 'Lead 分段没有跟随开关打开')
+    assert(sectionTextForMembership({ role: 'lead' }, false) === off, 'Lead 分段没有跟随开关关闭')
+    assert(on.includes('**派活（强制）**') && on.includes('必须'), '开关打开时没有要求强制派活')
+    assert(!on.includes('允许零个 teammate'), '开关打开时还留着「允许零个 teammate」')
+    assert(off.includes('**派活（按需）**') && off.includes('允许零个 teammate'), '开关关闭时没有放宽为按需')
+    // 只有派活段随开关变，其余必须逐字相同——否则开关会顺手改掉别的规则。
+    const strip = (text) => text.replace(DISPATCH_ON, '').replace(DISPATCH_OFF, '')
+    assert(strip(on) === strip(off), '除派活段以外还有文本随开关变化')
+    assert(Math.abs(on.length - off.length) < 400, '两版长度差异过大，说明分叉失控')
+    for (const id of ['frontend-design-engineer', 'backend-engineer', 'test-engineer', 'modeling-engineer']) {
+      assert(on.includes(id) && off.includes(id), `路由表缺 ${id}`)
+    }
+    const mode = teamModeEnabled(undefined)
+    assert(typeof mode.enabled === 'boolean' && typeof mode.source === 'string', 'teamModeEnabled 没有返回可判定结果')
+    return `开关开 ${on.length} 字符 / 开关关 ${off.length} 字符，除派活段外逐字相同`
+  })
+
+  check('派活通道指向宿主真实提供的工具', () => {
+    const policy = CODENOW_POLICY
+    assert(policy.includes('subagent'), '策略没有提到 subagent')
+    assert(policy.includes('wait_agent') || policy.includes('send_message'), '策略没有说明如何等结果/追问')
+    for (const name of ['subagent', 'subagent_fork', 'team_task_create', 'send_message']) {
+      assert(COORDINATION_TOOLS.test(name), `协调工具正则漏了 ${name}`)
+    }
+    const dispatch = policy.split('\n').find((line) => line.startsWith('**派活（默认必须）**')) ?? ''
+    assert(dispatch.includes('subagent'), '派活首选通道不是 subagent')
+    const spawnAt = dispatch.indexOf('spawn_teammate')
+    if (spawnAt >= 0) assert(spawnAt > dispatch.indexOf('subagent'), '派活首选通道仍写着 spawn_teammate')
   })
 
   check('项目状态按 root 隔离、迁移必须显式、坏文件不猜', () => {
@@ -2980,6 +3211,57 @@ function selfCheck() {
     } finally {
       try { rmSync(dir, { recursive: true, force: true }) } catch {}
     }
+  })
+  check('团队身份在无 membership API 时按会话父子判定（新版 DSH 已删 tryMembership）', () => {
+    const rows = listSessions()
+    let child = null
+    let parentId = ''
+    for (const row of rows) {
+      let head = {}
+      try {
+        head = readSessionHead(row.file) ?? {}
+      } catch {
+        head = {}
+      }
+      const parent = rootOf(head?.parentSession ?? '')
+      if (parent) {
+        child = row
+        parentId = parent
+        break
+      }
+    }
+    if (!child) return skip('磁盘上此刻没有派生子会话')
+    const childId = normalizeSessionId(child.id)
+    const asChild = memberOfAgent({ session: { id: childId } })
+    assert(asChild?.role === 'teammate', `子会话没被判成 teammate：${asChild?.role}`)
+    assert(asChild?.rootSessionId === parentId, `子会话的 root 不对：${asChild?.rootSessionId} != ${parentId}`)
+    assert(asChild?.name === readSubagentLabel(parentId, childId), '子会话名字没取到父会话投影里的 label')
+    const asLead = memberOfAgent({ session: { id: parentId } })
+    assert(asLead?.role === 'lead', `根会话没被判成 lead：${asLead?.role}`)
+    assert(asLead?.rootSessionId === parentId, '根会话的 root 不是自己')
+    assert(memberRecordOf(parentId, childId)?.role === 'teammate', 'memberRecordOf 没认出真子会话')
+    assert(memberRecordOf(parentId, 'not-a-child-of-this-root') === null, 'memberRecordOf 把陌生会话认成成员')
+    assert(memberOfAgent({ session: { id: 'deadbeef-0000-0000-0000-000000000000' } }) === null, '磁盘上不存在的会话被猜成了 lead')
+    return `真实子会话 ${childId} → teammate（root=${parentId}，name=${asChild.name || '（投影缺 label）'}）/ 根会话 → lead`
+  })
+  check('宿主版本兼容：投影形状无关解析 + 能力探测', () => {
+    // 投影结构从 v1 演进到 v7，未来还可能加版本；解析只认形状，不认版本号。
+    const rows = { title: { val: '标题A' }, modelSelection: { val: { lastUsed: { model: 'm1' } } } }
+    const shapes = [
+      ['v7', { version: 7, record: { rows } }],
+      ['v9', { version: 9, record: { rows } }],
+      ['legacy', { title: '标题A', model: 'm1' }],
+    ]
+    for (const [name, raw] of shapes) {
+      const got = projectionValue(raw)
+      assert(got.title === '标题A' && got.model === 'm1', name + ' 形状解析不符：' + JSON.stringify(got))
+    }
+    const empty = projectionValue({})
+    assert(empty.title === '' && empty.model === '', '空投影应返回空串而不是猜值')
+    const caps = hostCapabilities()
+    assert(typeof caps.teams.isEnabled === 'boolean' && typeof caps.agents.list === 'boolean', '能力快照类型不对')
+    assert(Array.isArray(caps.missing), '能力快照缺 missing 列表')
+    return '投影 v7/v9/旧版三种形状一致；当前缺项 ' + caps.missing.length + '（' + (caps.missing.join(',') || '无') + '）'
   })
   for (const result of results) {
     const tag = result.state === 'ok' ? 'ok  ' : result.state === 'skip' ? 'skip' : 'FAIL'

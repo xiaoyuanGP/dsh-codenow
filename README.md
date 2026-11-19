@@ -90,7 +90,7 @@ Lead 在新任务开始时先通过 `codenow({ action: "role", id: "chief-engine
 
 **不引入短退避**（比如 2 秒起、逐次翻倍、上限 1 分钟）：清扫是同步路径，睡在事件循环里会卡住宿主；180 秒的周期本身就已经是重试间隔。
 
-同理，`spawn_teammate` / `send_message` 失败不做重试——名额已满、成员会话已被回收、名字已占用都是硬失败，重试只会重复失败。
+同理，派活工具（`subagent`，旧宿主为 `spawn_teammate`）/ `send_message` 失败不做重试——名额已满、成员会话已被回收、名字已占用都是硬失败，重试只会重复失败。
 
 ### 插件重载会影响什么
 
@@ -146,13 +146,30 @@ Host 端 RPC 前缀 `/codenow`，端点 `state` / `live` / `chat` / `tasks` / `s
 - `sessions` 入参 `{offset, limit, q, withUsage}`：`limit` 1–200（默认 40），`q` 对 `id` / `title` / `cwd` / `preset` 做大小写不敏感子串匹配，`withUsage: true` 只返回账本里有用量记录的会话（筛选在分页之前，`total` 也是筛选后的总数）；返回 `{total, offset, limit, items}`（`total` 是过滤后的总数，不是本页条数）。
 - `chat` 入参 `{sessionId, limit, before}`：`limit` 1–500（默认 **50**）；返回 `{messages, hasMore, oldestSeq}`——`hasMore` 表示更早还有消息，翻页把 `oldestSeq` 当下一轮的 `before` 传回来即可（`before` 是事件 seq，语义是「只要 seq 比它小的消息」）。`messages` 结构与早先版本完全一致。
 
+## 宿主版本兼容
+
+插件同时适配 2026-11 之前与之后的 DSH，判定都写在代码里，不靠配置：
+
+| 能力 | 新宿主（2026-11 起） | 旧宿主 |
+|---|---|---|
+| 会话投影 | `{version:7, record:{identity, rows}}`，字段都在 `rows.<名字>.val` 下 | **只认形状不认版本号**：先取 `record.rows.*.val`，取不到退回顶层同名字段；v8/v9 只要还是这个形状就能读，实测 v7 / v9 / 旧版三种样本解析一致（自检第 21 条） |
+| 团队身份 | 服务只剩 `isEnabled / createTask / getTask / listTasks / updateTask`，**没有** `membership / listMembers`；改为按会话 `parentSession` 判 teammate / lead，名字取父会话投影里的 `subagentCatalog.label` | 先用 `tryMembership` |
+| 派活通道 | `subagent` / `subagent_fork`（`spawn_teammate` 服务端已不存在） | 若提供 `spawn_teammate` 则沿用 |
+| 团队协作开关 | `agentTeam.isEnabled(caller)`（同步）；开＝注入「必须派活」，关＝注入「按需」，读不到按关闭处理 | 无此开关，一律按需 |
+| 会话日志 | 仍为 `session.v3.jsonl.zstd` / `session.v4.jsonl.zstd`，帧格式未变 | 同 |
+| 账本 | 仍是 `<dshHome>/storages/cost-meter/ledger.json`，顶层 `days` 累加 | 同 |
+
+投影里现成可用的字段（插件按需读，缺失一律降级为空，不猜）：`title`、`modelSelection.lastUsed`、`agentPreset`、`workingDirectory`、`costUsage.totals`、`subagentCatalog.head.values[]`（含 `childId` / `label` / `mode`）。
+
+身份判定的边界：磁盘上根本不存在的会话返回 `null`（不猜成 lead，避免陌生人拿 Lead 权限）；旧宿主的 `tryMembership` 若存在且返回身份，仍以它为准。
+
 ## 自检
 
 ```bash
 node index.js
 ```
 
-跑 17 条真断言，每条落三态 `ok` / `skip` / `FAIL`：岗位 MD 全文与交接契约、公共规范 `_common.md` 逐字节前置到每份岗位全文（等值校验，外加 5 类变异必须被拒且拒绝位置要对；并断言它没混进岗位列表）、按帧切分与旧 magic 切分逐字节一致（会话正在被追加时降级为 `skip`，不当失败）、截断到第二帧头必须报「断帧」、清扫判据（**用真实磁盘上的派生子会话驱动，不再伪造任何样本**）、干跑真实数据打印候选数与排除理由分布、`session/end-seed` 不算收尾证据（挑一个**真实**以它收尾的会话断言 `tailSettled === false`）、岗位标签精确匹配、`sessions` / `chat` 入参契约、大文件尾部解码与全量解码逐字节一致、`state` 载荷可构造、语言分段按身份分流（Lead 中文 / teammate 纯 ASCII 英文 / 其余不注入）、任务 stage 只吃结构化字段（7 类映射逐一断言、活跃成员数拿不到时不许判停摆、首扫间隔 ≥600 秒）、项目状态可读写且版本可识别（坏文件不猜）、自动接续只在该唤醒时唤醒（叫停 / 去重 / Lead 忙 / 无项目四种情况逐一断言）、复核结论与阶段映射来自真实记录而不是猜（并断言自证会被拒绝）、投递恢复只重试该重试的（`sending` 超窗 / 退避到期 / 尝试上限 / `sent` 与 `consumed` 永不重试，重试复用同一 messageId）。汇总行形如 `codenow 自检：17 通过 / 0 跳过 / 0 失败`，**只有判成 FAIL 才**让退出码非 0（skip 不计入分母）。全程只读，不移动任何目录、不写 boot log。
+跑 21 条真断言，每条落三态 `ok` / `skip` / `FAIL`：岗位 MD 全文与交接契约、公共规范 `_common.md` 逐字节前置到每份岗位全文（等值校验，外加 5 类变异必须被拒且拒绝位置要对；并断言它没混进岗位列表）、按帧切分与旧 magic 切分逐字节一致（会话正在被追加时降级为 `skip`，不当失败）、截断到第二帧头必须报「断帧」、清扫判据（**用真实磁盘上的派生子会话驱动，不再伪造任何样本**）、干跑真实数据打印候选数与排除理由分布、`session/end-seed` 不算收尾证据（挑一个**真实**以它收尾的会话断言 `tailSettled === false`）、岗位标签精确匹配、`sessions` / `chat` 入参契约、大文件尾部解码与全量解码逐字节一致、`state` 载荷可构造、语言分段按身份分流（Lead 中文 / teammate 纯 ASCII 英文 / 其余不注入）、任务 stage 只吃结构化字段（7 类映射逐一断言、活跃成员数拿不到时不许判停摆、首扫间隔 ≥600 秒）、项目状态可读写且版本可识别（坏文件不猜）、自动接续只在该唤醒时唤醒（叫停 / 去重 / Lead 忙 / 无项目四种情况逐一断言）、复核结论与阶段映射来自真实记录而不是猜（并断言自证会被拒绝）、投递恢复只重试该重试的（`sending` 超窗 / 退避到期 / 尝试上限 / `sent` 与 `consumed` 永不重试，重试复用同一 messageId）、团队身份按会话父子判定（旧宿主先用 tryMembership；新宿主已移除该 API，改为「会话 header 有 parentSession → teammate，名字取父会话投影里的 subagentCatalog.label；没有 → lead；磁盘上不存在的会话返回 null，绝不猜成 lead」）、派活强度跟随团队协作开关（开＝必须至少派 1 个子智能体；关＝允许零个 teammate；除派活段外两版注入文本逐字相同）。汇总行形如 `codenow 自检：20 通过 / 0 跳过 / 0 失败`，**只有判成 FAIL 才**让退出码非 0（skip 不计入分母）。全程只读，不移动任何目录、不写 boot log、派活通道指向宿主真实提供的工具（`subagent` / `subagent_fork` / `wait_agent` 必须被识别，首选通道不能是旧宿主的 `spawn_teammate`）。
 
 清扫判据那条只对**真实存在**的派生子会话做断言：真实候选里不允许出现「在跑 / 父会话还在 / 非 one-shot / 尾巴没收尾」的任何一条。真实数据碰不到的判据分支会单独打印 `未验证：<分支>（真实数据未覆盖）`，**既不算通过也不算失败**——它只说明这几条路径在当前机器上没法被真实样本验证，别当成已验证。
 
@@ -177,7 +194,31 @@ node index.js
 ## 限制
 
 - 团队任务与成员存活状态取自 `team/task` / `team/member` 事件——这是权威值，不是从工具入参推断的。只有早期没有这类事件的会话才退回按 `team_task_create` 入参重建，那种回退没有状态（显示为 `-`）。
-- 插件对会话内容是只读的：不改会话、不写 ledger、不碰 CodeNow 仓库。唯一的磁盘写入是把已结束的子会话目录**搬进** `~/.dsh/codenow-trash/`（见「子会话回收」），以及 30 天后清理隔离区。派活由模型调用 DSH 内置 `spawn_teammate` / `team_task_*` 完成，插件只提供岗位全文与派活策略。
+- 插件对会话内容是只读的：不改会话、不写 ledger、不碰 CodeNow 仓库。唯一的磁盘写入是把已结束的子会话目录**搬进** `~/.dsh/codenow-trash/`（见「子会话回收」），以及 30 天后清理隔离区。派活由模型调用宿主提供的 `subagent` / `subagent_fork`（旧宿主为 `spawn_teammate`）/ `team_task_*` 完成，插件只提供岗位全文与派活策略。
 - 岗位是**静态快照**，CodeNow 侧更新后需手动同步 `assets/`。
 - `chat` 走「尾部解码」：文件大于 4 MB 时从尾巴往前解压，攒够条数就停（一次最多回读 8 MB，攒不够就继续往前扩）；解压失败或撞上半帧会记一行 `chat tail decode FAILED` 并回落全量解码，结果一样、只是慢。日志的**消息密度**很低（本机最大那个会话 20.8 MB / 169 条消息），所以要一次取到很早的消息时仍然要读完整份文件——`limit` 给 50 是 150 ms 级，给 200 会退化到 500 ms 级。
 - `chat` / `tasks` 有一次结果缓存（按 `mtime:size` 的 stamp 失效，各留 8 条，`before` 也进 key）。搬迁或清理隔离区后缓存整体清空，不会给出搬迁前的旧结果。
+
+### 0.2.2-rc.5（已实测）
+
+在 0.2.2-rc.5（@deepseek-ai/dsh-desktop-runtime@0.2.2-rc.5）上核对过的事实：
+
+| 面 | rc.5 现状 | 插件处置 |
+|---|---|---|
+| 派活工具 | dsh-base 仍注册 `toolName: subagent` / `subagent_fork`，服务端无 spawn_teammate | 策略首选 subagent |
+| 团队服务 | dsh-agent-team 仍有 isEnabled(caller)（写 	eam/mode 事件），仍无 membership/tryMembership/listMembers | isEnabled 优先，缺失时按 parentSession + 投影 subagentCatalog 判定 |
+| 团队任务工具 | 	eam_task_create/list/get/update 四个 | 任务板仍解压日志 	eam/task，投影 gentTeam.val.tasks 作权威值 |
+| 会话投影 | 仍为 {version:7, record:{identity{formatVersion:4}, rows}}（实测 284 份全是 v7） | projectionValue 只认形状 |
+| Agent 通道 | gent-loop 的 ollowup/steer/inject 均在 | 自动接续继续用 ollowup |
+| 插槽 | conversation.session.header.actions 仍在 slot-catalog 里 | 面板按钮不变 |
+
+### 0.2.2-rc.5 及以后
+
+RC 之间会改服务签名与包名，插件不靠版本号判断，只靠**能力探测**：
+
+- 启动时 `apply` 打一行 `host caps teams.isEnabled=1 tryMembership=0 listMembers=0 missing=-`，升级后先看这行就知道缺什么。
+- `setup` 端点（面板「环境」一节）附带 `host` 块：`services` / `teams{isEnabled, tryMembership, listMembers, createTask}` / `agents{list}` / `missing[]`。
+- 团队身份：`isEnabled` 在就先用它；不在就按会话 `parentSession` 与投影 `subagentCatalog` 判定；磁盘上不存在的会话一律返回 `null`（不猜成 Lead）。
+- 会话日志：`session[.v<N>].jsonl[.zstd]` 任意分代都认，自动取最大 N，新增 v5 不用改代码。
+- 会话投影：见上表，形状兼容而非版本兼容。
+- 宿主服务缺失时：`webServer` / `tools` / `systemPrompt` / `agentTeams` 全部 try/catch 包裹，缺哪个就少一块功能并留一行日志，不阻塞加载。

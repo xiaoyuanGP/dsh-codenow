@@ -22,6 +22,49 @@ window.__ModuleLoader__.load({
      *
      * react-dom 取不到时原样返回节点，退化成旧的内联渲染（不抛错、不白屏）。
      */
+    /**
+     * 内联样式画不出 :hover / :focus-visible / :disabled，所以补一张很小的一次性样式表。
+     * 只挂在 [data-cn] 作用域内（面板根节点与 portal 到 body 的弹层都带这个属性），
+     * 不碰宿主样式；宿主没有 document 时整个函数是空操作。
+     */
+    let cnStylesInjected = false
+    function injectCnStyles() {
+      if (cnStylesInjected) return
+      if (typeof document === 'undefined' || !document.head) return
+      const css = [
+        '[data-cn] button, [data-cn] select, [data-cn] input, [data-cn] td, [data-cn] tr {',
+        '  transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease, box-shadow 140ms ease;',
+        '}',
+        '[data-cn] button:hover:not(:disabled) {',
+        '  background: color-mix(in srgb, currentColor 10%, transparent) !important;',
+        '  border-color: color-mix(in srgb, currentColor 26%, transparent) !important;',
+        '}',
+        '[data-cn] button:active:not(:disabled) {',
+        '  background: color-mix(in srgb, currentColor 16%, transparent) !important;',
+        '}',
+        '[data-cn] button:disabled { opacity: .45 !important; cursor: default !important; }',
+        '[data-cn] [aria-busy="true"] { opacity: .6; cursor: progress; }',
+        '[data-cn] button:focus-visible, [data-cn] select:focus-visible, [data-cn] input:focus-visible {',
+        '  outline: 2px solid color-mix(in srgb, currentColor 45%, transparent);',
+        '  outline-offset: 1px;',
+        '}',
+        '[data-cn] tbody tr:hover { background: color-mix(in srgb, currentColor 4%, transparent); }',
+                '[data-cn-card] { transition: transform 160ms ease, box-shadow 160ms ease, border-color 160ms ease; }',
+                '[data-cn-card]:hover { transform: translateY(-1px); border-color: var(--cn-line-strong, currentColor) !important; box-shadow: 0 10px 24px rgba(0,0,0,0.18); }',
+                '[data-cn] ::-webkit-scrollbar { width: 10px; height: 10px; }',
+                '[data-cn] ::-webkit-scrollbar-thumb { background: color-mix(in srgb, currentColor 18%, transparent); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }',
+                '[data-cn] ::-webkit-scrollbar-thumb:hover { background: color-mix(in srgb, currentColor 30%, transparent); background-clip: padding-box; }',
+                '[data-cn] ::-webkit-scrollbar-track { background: transparent; }',
+        '@media (prefers-reduced-motion: reduce) {',
+        '  [data-cn] button, [data-cn] select, [data-cn] input, [data-cn] td, [data-cn] tr { transition: none; }',
+        '}',
+      ].join('\n')
+      const style = document.createElement('style')
+      style.setAttribute('data-cn-styles', '')
+      style.textContent = css
+      document.head.appendChild(style)
+      cnStylesInjected = true
+    }
     const portalIntoBody = (() => {
       if (typeof document === 'undefined' || document.body === null) return (node) => node
       let createPortal = null
@@ -63,20 +106,54 @@ window.__ModuleLoader__.load({
         : fetchRpc(endpoint, payload)
     }
 
-    const EDGE = 'color-mix(in srgb, currentColor 16%, transparent)'
-    const SOFT = 'color-mix(in srgb, currentColor 7%, transparent)'
-    const MUTED = 'color-mix(in srgb, currentColor 62%, transparent)'
+    const EDGE = 'var(--cn-line, color-mix(in srgb, currentColor 16%, transparent))'
+    const SOFT = 'var(--cn-surface-3, color-mix(in srgb, currentColor 7%, transparent))'
+    const MUTED = 'var(--cn-text-dim, color-mix(in srgb, currentColor 62%, transparent))'
     const MONO = 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace'
+
+    const EDGE_STRONG = 'var(--cn-line-strong, color-mix(in srgb, currentColor 22%, transparent))'
+    const FAINT = 'var(--cn-line-faint, color-mix(in srgb, currentColor 7%, transparent))'
+    const CARD_BG = 'var(--cn-surface-2, color-mix(in srgb, currentColor 3%, transparent))'
+    const ACCENT = 'var(--cn-accent, currentColor)'
+
+    /**
+     * 主题变量：宿主背景可能是半透明/带壁纸的，插件不能只靠 color-mix 叠透明色，
+     * 否则壁纸透上来整块面板就糊。这里给一套不透明的自建表面色，明暗各一套。
+     */
+    function cnTokens(scheme) {
+      const dark = scheme !== 'light'
+      return {
+        '--cn-surface': dark ? '#15151a' : '#ffffff',
+        '--cn-surface-2': dark ? '#1e1e26' : '#f7f8fa',
+        '--cn-surface-3': dark ? '#262630' : '#eef1f5',
+        '--cn-elevated': dark ? '#1b1b22' : '#ffffff',
+        '--cn-line': dark ? 'rgba(255,255,255,0.10)' : 'rgba(15,23,42,0.10)',
+        '--cn-line-strong': dark ? 'rgba(255,255,255,0.18)' : 'rgba(15,23,42,0.18)',
+        '--cn-line-faint': dark ? 'rgba(255,255,255,0.06)' : 'rgba(15,23,42,0.06)',
+        '--cn-text-dim': dark ? 'rgba(255,255,255,0.64)' : 'rgba(15,23,42,0.64)',
+        '--cn-accent': dark ? '#7aa2ff' : '#3b6ef5',
+        '--cn-shadow': dark ? '0 18px 40px rgba(0,0,0,0.45)' : '0 18px 40px rgba(15,23,42,0.12)',
+      }
+    }
+    // 交互反馈统一走注入样式表（见 factory 末尾 injectCnStyles）；这里是它的选择器前缀。
+    const CN = 'codenow'
 
     const S = {
       root: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, overflow: 'hidden', fontSize: 13 },
-      header: { display: 'flex', alignItems: 'flex-start', gap: 16, padding: '20px 24px 12px' },
-      title: { fontSize: 17, fontWeight: 600, lineHeight: 1.3 },
-      subtitle: { marginTop: 4, fontSize: 12, color: MUTED, lineHeight: 1.5 },
+      header: {
+        display: 'flex',
+        alignItems: 'center',
+        gap: 12,
+        padding: '18px 24px 14px',
+        background: 'linear-gradient(180deg, color-mix(in srgb, currentColor 5%, transparent), transparent)',
+        borderBottom: `1px solid ${FAINT}`,
+      },
+      title: { fontSize: 16, fontWeight: 600, lineHeight: '22px', letterSpacing: '-0.01em' },
+      subtitle: { marginTop: 2, fontSize: 12, color: MUTED, lineHeight: '16px' },
       spacer: { flex: 1 },
       tabs: {
-        display: 'flex',
-        gap: 4,
+        gap: 6,
+        padding: '10px 24px 12px',
         padding: '0 24px',
         borderBottom: `1px solid ${EDGE}`,
       },
@@ -89,11 +166,9 @@ window.__ModuleLoader__.load({
         fontSize: 12.5,
         cursor: 'pointer',
         fontFamily: 'inherit',
-        borderBottom: '2px solid transparent',
-        marginBottom: -1,
       },
-      tabOn: { color: 'inherit', fontWeight: 600, borderBottom: '2px solid currentColor' },
-      body: { flex: 1, minHeight: 0, overflowY: 'auto', padding: '16px 24px 28px', display: 'flex', flexDirection: 'column', gap: 12 },
+      tabOn: { color: 'inherit', fontWeight: 600, background: SOFT, boxShadow: `inset 0 0 0 1px ${EDGE}` },
+      body: { flex: 1, minHeight: 0, overflowY: 'auto', padding: '20px 24px 32px', display: 'flex', flexDirection: 'column', gap: 16 },
       btn: {
         appearance: 'none',
         border: `1px solid ${EDGE}`,
@@ -130,17 +205,30 @@ window.__ModuleLoader__.load({
         fontSize: 12,
         fontFamily: 'inherit',
       },
-      card: { border: `1px solid ${EDGE}`, borderRadius: 10, padding: '12px 14px' },
-      cardTitle: { fontSize: 13.5, fontWeight: 600, lineHeight: 1.4 },
-      meta: { marginTop: 3, fontSize: 11.5, color: MUTED, lineHeight: 1.5 },
-      grid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 10 },
-      stat: { display: 'flex', gap: 18, flexWrap: 'wrap' },
-      statBox: { minWidth: 108 },
-      statLabel: { fontSize: 11, color: MUTED, marginBottom: 2 },
-      statValue: { fontSize: 16, fontWeight: 600, fontFamily: MONO },
-      table: { width: '100%', borderCollapse: 'collapse', fontSize: 12 },
-      th: { textAlign: 'left', padding: '6px 8px', borderBottom: `1px solid ${EDGE}`, color: MUTED, fontWeight: 500, whiteSpace: 'nowrap' },
-      td: { padding: '7px 8px', borderBottom: `1px solid ${EDGE}`, verticalAlign: 'top' },
+      card: {
+        border: `1px solid ${EDGE}`,
+        borderRadius: 12,
+        padding: '14px 16px',
+        background: CARD_BG,
+        boxShadow: 'var(--cn-shadow, none)',
+      },
+      cardTitle: {
+        fontSize: 13,
+        fontWeight: 600,
+        lineHeight: '18px',
+        letterSpacing: '-0.005em',
+        paddingLeft: 10,
+        borderLeft: `3px solid ${ACCENT}`,
+      },
+      meta: { marginTop: 3, fontSize: 12, color: MUTED, lineHeight: '16px' },
+      grid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))', gap: 14 },
+      stat: { display: 'flex', gap: 24, flexWrap: 'wrap' },
+      statBox: { minWidth: 120 },
+      statLabel: { fontSize: 11, fontWeight: 500, color: MUTED, marginBottom: 4, textTransform: 'uppercase', letterSpacing: '0.04em' },
+      statValue: { fontSize: 20, fontWeight: 600, fontFamily: MONO, letterSpacing: '-0.02em', fontVariantNumeric: 'tabular-nums' },
+      table: { width: '100%', borderCollapse: 'collapse', fontSize: 12, fontVariantNumeric: 'tabular-nums' },
+      th: { textAlign: 'left', padding: '8px 8px', borderBottom: `1px solid ${EDGE}`, color: MUTED, fontWeight: 600, whiteSpace: 'nowrap', fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.04em', position: 'sticky', top: 0, zIndex: 1, background: 'var(--cn-surface, transparent)' },
+      td: { padding: '7px 8px', borderBottom: `1px solid ${FAINT}`, verticalAlign: 'top' },
       num: { fontFamily: MONO, whiteSpace: 'nowrap' },
       split: { display: 'flex', gap: 12, minHeight: 0, flex: 1 },
       list: { width: 240, flexShrink: 0, overflowY: 'auto', border: `1px solid ${EDGE}`, borderRadius: 10, padding: 6, display: 'flex', flexDirection: 'column', gap: 2 },
@@ -157,26 +245,57 @@ window.__ModuleLoader__.load({
         fontFamily: 'inherit',
       },
       itemOn: { background: SOFT, border: `1px solid ${EDGE}` },
-      stream: { flex: 1, minWidth: 0, overflowY: 'auto', border: `1px solid ${EDGE}`, borderRadius: 10, padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: 10 },
-      msg: { display: 'flex', flexDirection: 'column', gap: 3 },
+      stream: { flex: 1, minWidth: 0, overflowY: 'auto', border: `1px solid ${EDGE}`, borderRadius: 10, padding: '16px 18px', display: 'flex', flexDirection: 'column', gap: 12 },
+      msg: { display: 'flex', flexDirection: 'column', gap: 4 },
       msgHead: { fontSize: 11, color: MUTED, fontFamily: MONO },
-      bubble: { whiteSpace: 'pre-wrap', lineHeight: 1.6, fontSize: 12.5, borderLeft: `2px solid ${EDGE}`, paddingLeft: 10 },
+      bubble: { whiteSpace: 'pre-wrap', lineHeight: 1.65, fontSize: 13, borderLeft: `3px solid ${EDGE_STRONG}`, paddingLeft: 12 },
       bar: { height: 6, borderRadius: 3, background: SOFT, overflow: 'hidden', marginTop: 6 },
-      barFill: { height: '100%', background: 'currentColor', opacity: 0.45 },
-      notice: { fontSize: 11.5, color: MUTED, lineHeight: 1.6, borderLeft: `2px solid ${EDGE}`, paddingLeft: 10 },
+      barFill: { height: '100%', background: 'currentColor', opacity: 0.55 },
+      notice: { fontSize: 12, color: MUTED, lineHeight: 1.6, background: SOFT, borderRadius: 8, padding: '8px 12px' },
       // 宿主用 --dsw-alias-label-error 表达错误文本（首方 CSS 既有用法）；缺令牌时退回原红。
-      error: { fontSize: 12, color: 'var(--dsw-alias-label-error, #c0392b)' },
-      empty: { padding: '24px 0', fontSize: 12, color: MUTED },
+      error: { fontSize: 12.5, color: 'var(--dsw-alias-label-error, #c0392b)', background: 'color-mix(in srgb, var(--dsw-alias-label-error, #c0392b) 8%, transparent)', border: '1px solid color-mix(in srgb, var(--dsw-alias-label-error, #c0392b) 30%, transparent)', borderRadius: 8, padding: '8px 12px', lineHeight: 1.5 },
+      empty: { padding: '40px 24px', fontSize: 13, color: MUTED, textAlign: 'center', border: `1px dashed ${EDGE}`, borderRadius: 10, lineHeight: 1.6 },
+      emptyInline: { padding: '24px 0', fontSize: 13, color: MUTED },
+      pill: {
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 4,
+        padding: '1px 8px',
+        borderRadius: 999,
+        fontSize: 11,
+        fontWeight: 500,
+        lineHeight: '16px',
+        border: `1px solid ${EDGE}`,
+        color: MUTED,
+        whiteSpace: 'nowrap',
+      },
       tag: {
-        display: 'inline-block',
-        padding: '1px 6px',
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 4,
+        padding: '1px 8px',
         marginRight: 6,
-        borderRadius: 4,
-        fontSize: 10.5,
+        borderRadius: 999,
+        fontSize: 11,
+        fontWeight: 500,
+        lineHeight: '16px',
+        whiteSpace: 'nowrap',
         border: `1px solid ${EDGE}`,
         color: MUTED,
       },
-      envBar: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 10, padding: '0 24px 10px', fontSize: 11.5, color: MUTED },
+      envBar: {
+        display: 'flex',
+        alignItems: 'center',
+        flexWrap: 'wrap',
+        gap: 12,
+        margin: '0 24px 12px',
+        padding: '8px 12px',
+        fontSize: 12,
+        color: MUTED,
+        background: SOFT,
+        borderRadius: 10,
+        border: `1px solid ${FAINT}`,
+      },
       envItem: { display: 'inline-flex', alignItems: 'center', gap: 4 },
       envMissing: { color: 'var(--dsw-alias-label-error, #c0392b)' },
       envBtn: {
@@ -543,12 +662,13 @@ window.__ModuleLoader__.load({
                     color: 'var(--dsw-alias-label-primary, #e8e8ef)',
                     border: '1px solid var(--dsw-alias-border-l2, #3a3a44)',
                     borderRadius: 12,
-                    padding: 14,
+                    padding: 16,
                     display: 'flex',
                     flexDirection: 'column',
-                    gap: 8,
-                    boxShadow: '0 18px 48px rgba(0,0,0,0.5)',
+                    gap: 10,
+                    boxShadow: '0 12px 32px rgba(0,0,0,0.24), 0 2px 6px rgba(0,0,0,0.16)',
                   },
+                  'data-cn': '',
                   onClick: (event) => event.stopPropagation(),
                 },
                 h(
@@ -622,7 +742,7 @@ window.__ModuleLoader__.load({
             roles.map((role) =>
               h(
                 'div',
-                { key: role.id, style: S.card },
+                { key: role.id, style: S.card, 'data-cn-card': '' },
                 h(
                   'div',
                   { style: { display: 'flex', alignItems: 'baseline', gap: 8, flexWrap: 'wrap' } },
@@ -630,7 +750,7 @@ window.__ModuleLoader__.load({
                   role.level
                     ? h(
                         'div',
-                        { style: { ...S.meta, padding: '1px 6px', border: `1px solid ${EDGE}`, borderRadius: 999, fontSize: 10.5 } },
+                        { style: S.pill },
                         role.level
                       )
                     : null
@@ -834,8 +954,8 @@ window.__ModuleLoader__.load({
                 h('button', { style: { ...S.btn, height: 22, marginLeft: 4 }, onClick: () => setAttempt((value) => value + 1) }, '重试')
               )
             : null,
-          loading ? h('div', { style: S.empty }, '读取会话日志…') : null,
-          !loading && !error && messages.length === 0 ? h('div', { style: S.empty }, '这个会话还没有可回放的对话') : null,
+          loading ? h('div', { style: S.emptyInline }, '读取会话日志…') : null,
+          !loading && !error && messages.length === 0 ? h('div', { style: S.emptyInline }, '这个会话还没有可回放的对话') : null,
           messages.map((message, index) =>
             h(
               'div',
@@ -909,7 +1029,7 @@ window.__ModuleLoader__.load({
             'select',
             {
               ref: selectRef,
-              style: selectScheme ? { ...S.btn, paddingRight: 8, colorScheme: selectScheme } : { ...S.btn, paddingRight: 8 },
+          style: selectScheme ? { ...S.select, padding: '5px 28px 5px 10px', colorScheme: selectScheme } : { ...S.select, padding: '5px 28px 5px 10px' },
               'aria-label': '选择会话',
               value: sessionId || '',
               onChange: (event) => onPick(event.target.value),
@@ -946,7 +1066,7 @@ window.__ModuleLoader__.load({
               h('button', { style: { ...S.btn, height: 22, marginLeft: 4 }, onClick: () => setAttempt((value) => value + 1) }, '重试')
             )
           : null,
-        loading ? h('div', { style: S.empty }, '读取中…') : null,
+        loading ? h('div', { style: S.emptyInline }, '读取中…') : null,
         data && data.todos.length
           ? h(
               'div',
@@ -1019,7 +1139,7 @@ window.__ModuleLoader__.load({
               )
             )
           : data && !data.todos.length
-            ? h('div', { style: S.empty }, '该会话没有待办或团队任务记录')
+            ? h('div', { style: S.emptyInline }, '该会话没有待办或团队任务记录')
             : null,
         data && data.actions.length
           ? h(
@@ -1267,6 +1387,9 @@ window.__ModuleLoader__.load({
     }
 
     function Panel() {
+      const panelRef = useRef(null)
+      const scheme = useHostScheme(panelRef)
+      injectCnStyles()
       const [tab, setTab] = useState('team')
       const [state, setState] = useState(null)
       const [sessionId, setSessionId] = useState('')
@@ -1347,6 +1470,9 @@ window.__ModuleLoader__.load({
         return () => { requestRef.current += 1; clearInterval(timer) }
       }, [refresh])
       useEffect(() => { loadEnv() }, [loadEnv])
+      // 原生下拉列表由 UA 绘制，只能靠 color-scheme 决定底色；不声明就会白底浅字看不清。
+      const projSelectRef = useRef(null)
+      const projScheme = useHostScheme(projSelectRef)
 
       // 只是一次条件分派：元素每次 render 都会重建，套记忆化没有收益。
       let content = h(TeamTab, { state })
@@ -1363,7 +1489,7 @@ window.__ModuleLoader__.load({
 
       return h(
         'div',
-        { style: S.root },
+        { style: { ...S.root, ...cnTokens(scheme), background: 'var(--cn-surface)' }, ref: panelRef, 'data-cn': '' },
         h(
           'div',
           { style: S.header },
@@ -1374,10 +1500,16 @@ window.__ModuleLoader__.load({
             h('div', { style: S.subtitle }, summary)
           ),
           h('div', { style: S.spacer }),
-          h('select', { value: sessionId, onChange: (event) => pickSession(event.target.value), 'aria-label': '项目所属会话', style: { ...S.select, maxWidth: 280 } },
-            !sessionId ? h('option', { value: '' }, '选择会话') : null,
-            sessionId && !(state?.sessions ?? []).some((row) => row.id === sessionId) ? h('option', { value: sessionId }, shortSession(sessionId)) : null,
-            (state?.sessions ?? []).map((row) => h('option', { key: row.id, value: row.id }, sessionLabel(row)))),
+          h('select', {
+            ref: projSelectRef,
+            value: sessionId,
+            onChange: (event) => pickSession(event.target.value),
+            'aria-label': '项目所属会话',
+            style: projScheme ? { ...S.select, maxWidth: 280, colorScheme: projScheme } : { ...S.select, maxWidth: 280 },
+          },
+            !sessionId ? h('option', { value: '', style: OPTION_STYLE }, '选择会话') : null,
+            sessionId && !(state?.sessions ?? []).some((row) => row.id === sessionId) ? h('option', { value: sessionId, style: OPTION_STYLE }, shortSession(sessionId)) : null,
+            (state?.sessions ?? []).map((row) => h('option', { key: row.id, value: row.id, style: OPTION_STYLE }, sessionLabel(row)))),
           h('button', { style: S.btn, onClick: refresh, disabled: loading, 'aria-busy': loading }, loading ? '刷新中…' : '刷新')
         ),
         h(
