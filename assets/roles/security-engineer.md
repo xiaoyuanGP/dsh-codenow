@@ -38,6 +38,7 @@ collaboration:
     - mobile-client-engineer
     - system-architect
     - github-repo-manager
+    - vuln-researcher
   can_handoff_to:
     - backend-engineer
     - frontend-design-engineer
@@ -45,6 +46,7 @@ collaboration:
     - chief-engineer
     - technical-writer
     - github-repo-manager
+    - vuln-researcher
   handoff_requires:
     - objective
     - findings

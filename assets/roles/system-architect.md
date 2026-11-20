@@ -50,6 +50,7 @@ collaboration:
     - technical-writer
     - chief-engineer
     - docx-engineer
+    - vuln-researcher
   handoff_requires:
     - objective
     - architecture_decision

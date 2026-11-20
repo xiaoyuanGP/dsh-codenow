@@ -10,7 +10,7 @@
 
 | 数据 | 来源 | 说明 |
 | --- | --- | --- |
-| 岗位（17 个） | `assets/roles/*.md` | 沿用 Origin CodeNow 的 frontmatter 约定；分两层：1 名首席工程师 + 16 名专家工程师，均按资深工程师的分析、实施、验证和交接标准维护。版本：既有 12 份为 `2.2.0`，新增的 5 份（演示文稿、Word、Excel、GitHub 仓库、Blender 建模）为 `1.0.0` |
+| 岗位（18 个） | `assets/roles/*.md` | 沿用 Origin CodeNow 的 frontmatter 约定；分两层：1 名首席工程师 + 17 名专家工程师，均按资深工程师的分析、实施、验证和交接标准维护。版本：既有 12 份为 `2.2.0`，新增的 5 份（演示文稿、Word、Excel、GitHub 仓库、Blender 建模）为 `1.0.0` |
 | 公共规范 | `assets/roles/_common.md` | 分析规范、实施规范、协作契约三节；不是岗位（`listRoles()` 跳过 `_` 前缀），由插件前置到每份岗位全文之前 |
 | 会话与消息 | `~/.dsh/sessions/**/session[.vN].jsonl.zstd` | 多帧 zstd 串联，按帧结构（magic + 帧头 + block 遍历）逐帧切分后解压。**分代取名**：同一目录里可能同时躺着 v3 与 v4，取 N 最大的那一个（无代号按 v1）；行上带 `format`（`v4` / `v3`），本机 90 个会话里 v4 68 个、仅 v3 22 个 |
 | 会话标题 | `~/.dsh/storages/session_projcache/sessions/<uuid>.json` | `record.rows.title.val`；磁盘上同时存在 `session-<uuid>.json` 与裸 `<uuid>.json` 两种命名，两个候选都试，不能只补前缀 |
@@ -36,7 +36,7 @@ Lead 在新任务开始时先通过 `codenow({ action: "role", id: "chief-engine
 
 侧边栏「协同工作台」，5 个页签：
 
-- **协同** — 17 个岗位卡片（层级、职责、可交接对象）
+- **协同** — 18 个岗位卡片（层级、职责、可交接对象）
 - **群聊** — 选会话，看真人消息与助手回复的完整时间线，向上翻页加载更早（游标取当前已加载消息里最小的 `seq`，一次 50 条；切会话或刷新时在飞的旧请求会被丢弃，不会串进新列表）
 - **会话头部** — 一个「AI 团队」按钮，点开看每个正在干活的岗位、所属主智能体及其模型；没人在跑时按钮隐藏
 - **任务** — 当前待办快照 + 团队任务（带状态列与**归属列**，`deleted` 的不显示）+ 协同动作流水（spawn / send_message / 任务增删）。归属列回答「这件事现在卡在谁身上」：`等你验收` / `等上游` / `进行中` / `未开始` / `疑似停摆（推测）` / `未知`，`等你验收` 的行置顶加粗，标题上会顶出「等你处理 N」。它**只吃结构化字段**（见「数据来源」），不从消息文本猜；旧版 Host 没有这个字段时该列显示 `-`
@@ -129,7 +129,7 @@ codenow({ action: "setup" })                    # 只读检测：内置技能 / 
 codenow({ action: "project", op: "status" })    # 项目状态；op 另有 open / task / verify / ask / next / deliver / stop / resume
 ```
 
-`state` 里的 `roles` 只有元数据（不含正文、不含磁盘路径），要全文就调 `role`——别把 17 份全文塞进一次 `state`。
+`state` 里的 `roles` 只有元数据（不含正文、不含磁盘路径），要全文就调 `role`——别把 18 份全文塞进一次 `state`。
 
 ## 安装
 

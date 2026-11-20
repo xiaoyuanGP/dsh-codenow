@@ -48,6 +48,7 @@ collaboration:
     - security-engineer
     - pptx-engineer
     - docx-engineer
+    - vuln-researcher
   can_handoff_to:
     - code-quality-reviewer
     - chief-engineer

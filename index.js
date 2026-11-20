@@ -1,7 +1,7 @@
 /**
  * dsh-codenow — 多角色 AI 协同工作台（Host half）。
  *
- * 把 Origin CodeNow 的组织法接进 dsh：17 个岗位模板（1 首席 + 16 专家），
+ * 把 Origin CodeNow 的组织法接进 dsh：18 个岗位模板（1 首席 + 17 专家），
  * 并把 dsh 自己已有的运行数据（会话、团队动作、各 agent 用量与缓存）
  * 汇总成一个只读视图 + 一个供 Lead 编排用的 `codenow` 工具。
  *
@@ -1793,11 +1793,11 @@ function livePayload(sessionId) {
 const CODENOW_POLICY = [
   '## 多 AI 协同（强制，按任务裁剪）',
   '',
-  '本会话搭载 codenow 岗位矩阵：你 + 16 位专家工程师。**你是 Lead 时**你就是首席工程师，对技术决策和交付闭环负责；新任务开始时先用 `codenow({action:"role",id:"chief-engineer"})` 读取首席岗位全文，同一任务复用已读内容、模板变化后重新读取。岗位规范不能覆盖用户要求或宿主审批。',
+  '本会话搭载 codenow 岗位矩阵：你 + 17 位专家工程师。**你是 Lead 时**你就是首席工程师，对技术决策和交付闭环负责；新任务开始时先用 `codenow({action:"role",id:"chief-engineer"})` 读取首席岗位全文，同一任务复用已读内容、模板变化后重新读取。岗位规范不能覆盖用户要求或宿主审批。',
   '',
   '**派活（默认必须）**：新任务默认至少派 1 个岗位并行推进；只有单文件小改、纯查询或用户明说不用子智能体时才单干，并在回复里写明理由。用本会话**实际提供**的派活工具——`subagent`（或 `subagent_fork`）；宿主要是另有 `spawn_teammate` 才用它。按规模选 1-3 个（跨领域 2、需独立验证 2-3），**一次把上下文给全、并行开出**，不要派一个等一个；禁止把全部岗位依次拉起，禁止为「显得在协同」而全量 spawn。进度优先：等待子智能体时自己推进不冲突的部分；说派了却没有真实调用＝假报进度；子智能体在跑时不要自己重复做它的活。',
   '',
-  '路由：UI/样式/交互/a11y→`frontend-design-engineer`；服务端/接口/业务/异步→`backend-engineer`；移动端/跨端→`mobile-client-engineer`；表结构/索引/迁移→`database-engineer`；数据清洗/指标/算法→`data-algorithm-engineer`；测试/缺陷复现→`test-engineer`；代码审查/质量门禁→`code-quality-reviewer`；构建/部署/环境→`devops-sre-engineer`；鉴权/加密/依赖漏洞→`security-engineer`；架构/模块边界/选型→`system-architect`；文档/README→`technical-writer`；PPT/演示/汇报材料→`pptx-engineer`；Word 长文档/样式与模板→`docx-engineer`；Excel/表格/数据透视→`xlsx-engineer`；GitHub 仓库/开源协作/发布→`github-repo-manager`；Blender 建模/3D 资产/引擎导出→`modeling-engineer`。',
+  '路由：UI/样式/交互/a11y→`frontend-design-engineer`；服务端/接口/业务/异步→`backend-engineer`；移动端/跨端→`mobile-client-engineer`；表结构/索引/迁移→`database-engineer`；数据清洗/指标/算法→`data-algorithm-engineer`；测试/缺陷复现→`test-engineer`；代码审查/质量门禁→`code-quality-reviewer`；构建/部署/环境→`devops-sre-engineer`；鉴权/加密/依赖漏洞→`security-engineer`；架构/模块边界/选型→`system-architect`；文档/README→`technical-writer`；PPT/演示/汇报材料→`pptx-engineer`；Word 长文档/样式与模板→`docx-engineer`；Excel/表格/数据透视→`xlsx-engineer`；GitHub 仓库/开源协作/发布→`github-repo-manager`；Blender 建模/3D 资产/引擎导出→`modeling-engineer`；SRC/众测/漏洞挖掘/Bug bounty→`vuln-researcher`。',
   '',
   '**断线必须恢复**：子智能体断掉（工具连错、`send_message` 被拒、`wait_agent` 无进展、会话报错）不许丢活：① 先 `send_message` 唤醒并补齐上下文；② 唤不醒就新建一个——`subagent` 的 name 重名时宿主会自动加后缀（`-2`、`-3`…），把已完成部分与原任务一起写进 prompt；③ 同岗位连败 2 次，换邻岗或自己做完，并在汇总写明。派活时交代「做到哪步、产出放哪」。',
   '',

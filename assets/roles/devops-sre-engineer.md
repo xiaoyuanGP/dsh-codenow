@@ -46,6 +46,7 @@ collaboration:
     - code-quality-reviewer
     - technical-writer
     - github-repo-manager
+    - vuln-researcher
   handoff_requires:
     - objective
     - build_artifacts

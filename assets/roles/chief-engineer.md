@@ -58,6 +58,7 @@ collaboration:
     - docx-engineer
     - xlsx-engineer
     - github-repo-manager
+    - vuln-researcher
   can_handoff_to:
     - modeling-engineer
     - system-architect
@@ -75,6 +76,7 @@ collaboration:
     - docx-engineer
     - xlsx-engineer
     - github-repo-manager
+    - vuln-researcher
   handoff_requires:
     - objective
     - scope_and_non_goals

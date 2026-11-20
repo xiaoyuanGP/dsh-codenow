@@ -2,7 +2,7 @@
 
 本文件说明 DSH CodeNow 岗位 Markdown 的格式与能力约定，沿用 Origin CodeNow 的 frontmatter 结构；本文件不是可加载岗位。
 
-## 岗位矩阵（17 个 Agent 角色）
+## 岗位矩阵（18 个 Agent 角色）
 
 用户本人是 **CTO**，不属于 Agent 角色，因此没有 CTO 模板。
 
@@ -12,7 +12,7 @@
 |---|---|---|
 | `chief-engineer` | 首席工程师（项目经理） | 交付总责：定范围、选角、拍板、验收 |
 
-### 专家工程师（16）
+### 专家工程师（17）
 
 | role_id | 显示名 | 定位 |
 |---|---|---|
@@ -32,13 +32,14 @@
 | `xlsx-engineer` | Excel数据工程师 | 口径建模、公式工程与数据质量 |
 | `github-repo-manager` | GitHub开源项目与仓库管理工程师 | 仓库治理、发布与开源协作（调用宿主已连接的 GitHub 能力） |
 | `modeling-engineer` | 建模资深工程师 | Blender 建模、3D 资产规格与引擎导出（UE / FiveM） |
+| `vuln-researcher` | SRC 漏洞工程师 | 授权目标挖掘、证据链、PoC 与补天 / TSRC 报告（仅这两个平台） |
 
-组织层级：CTO（用户）→ 首席工程师 → 16 个专家工程师。
+组织层级：CTO（用户）→ 首席工程师 → 17 个专家工程师。
 工程师通过宿主已有的团队消息和任务交接协作。`collaboration` 描述岗位间的交接关系，不创建运行时成员、指挥权或审批权限；实际权限以宿主团队身份和用户授权为准。
 
 ## 资深工程师能力基线
 
-岗位规范版本：既有 12 份为 `2.2.0`（`chief-engineer` 本轮因自主执行与提问升级规则升到 `2.3.0`），新增的 5 份（`pptx-engineer`、`docx-engineer`、`xlsx-engineer`、`github-repo-manager`、`modeling-engineer`）为 `1.0.0`。首席承担技术决策和交付总责，其余岗位保持专业分工，均按以下标准工作：
+岗位规范版本：既有 12 份为 `2.2.0`（`chief-engineer` 本轮因自主执行与提问升级规则升到 `2.3.0`），新增的 6 份（`pptx-engineer`、`docx-engineer`、`xlsx-engineer`、`github-repo-manager`、`modeling-engineer`、`vuln-researcher`）为 `1.0.0`。首席承担技术决策和交付总责，其余岗位保持专业分工，均按以下标准工作：
 
 - 先追踪真实入口、调用方、状态与副作用，明确用户目标、契约、约束和不可破坏的不变量。
 - 以证据选择最小完整方案，解释取舍和恢复条件；不硬套技术栈，不为小任务制造架构、岗位或流程。

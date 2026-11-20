@@ -42,6 +42,7 @@ collaboration:
     - docx-engineer
     - xlsx-engineer
     - github-repo-manager
+    - vuln-researcher
   can_handoff_to:
     - frontend-design-engineer
     - backend-engineer
