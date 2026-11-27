@@ -45,6 +45,7 @@ collaboration:
     - modeling-engineer
     - system-architect
     - frontend-design-engineer
+    - wechat-h5-engineer
     - backend-engineer
     - mobile-client-engineer
     - database-engineer
@@ -63,6 +64,7 @@ collaboration:
     - modeling-engineer
     - system-architect
     - frontend-design-engineer
+    - wechat-h5-engineer
     - backend-engineer
     - mobile-client-engineer
     - database-engineer

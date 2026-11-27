@@ -1,7 +1,7 @@
 /**
  * dsh-codenow — 多角色 AI 协同工作台（Host half）。
  *
- * 把 Origin CodeNow 的组织法接进 dsh：18 个岗位模板（1 首席 + 17 专家），
+ * 把 Origin CodeNow 的组织法接进 dsh：19 个岗位模板（1 首席 + 18 专家），
  * 并把 dsh 自己已有的运行数据（会话、团队动作、各 agent 用量与缓存）
  * 汇总成一个只读视图 + 一个供 Lead 编排用的 `codenow` 工具。
  *
@@ -236,6 +236,12 @@ function parseFirstEvent(text) {
 function readSessionHead(file) {
   const view = readWindow(file, 0, HEAD_BYTES)
   if (!view) return {}
+  const first = zstdFrameRanges(view).ranges[0]
+  if (first) {
+    const text = decodeSessionFrames(view.subarray(first.start, first.end)).text
+    // 首条完整记录通常独占首帧；跨帧或尚未写完时仍走原有窗口解码。
+    if (text.trimStart().includes('\n')) return parseFirstEvent(text)
+  }
   return parseFirstEvent(decodeSessionFrames(view).text)
 }
 
@@ -717,7 +723,7 @@ function sessionLogOf(dir) {
 /** 分代标签（`v4` / `v3`）：前端要能看出这条是第几代日志。 */
 const formatOf = (generation) => `v${generation}`
 
-/** 一条会话行（listSessions 与 findSession 快路径共用）：文件中途消失就返回 null。 */
+/** 会话元数据不读标题（listSessions 与 findSession 共用）；文件中途消失返回 null。 */
 function sessionRowOf(workspace, dirName, log) {
   const file = log.file
   try {
@@ -733,7 +739,6 @@ function sessionRowOf(workspace, dirName, log) {
       createdAt: Number(head.createdAt) || 0,
       updatedAt: stat.mtimeMs,
       bytes: stat.size,
-      title: readProjection(id).title,
       format: formatOf(log.generation),
       file,
     }
@@ -1093,7 +1098,7 @@ function findSession(sessionId) {
       workspaces = []
     }
     // 目录名就是 id（带或不带 `session-` 前缀），每工作区两次 stat 就命中，
-    // 不用整盘 listSessions（90 个会话要读 90 份头部 + 90 份标题投影）。
+    // 不用整盘 listSessions，避免为一次定位读取所有会话头部。
     for (const workspace of workspaces) {
       for (const dirName of [target, `session-${target}`]) {
         const log = sessionLogOf(join(root, workspace, dirName))
@@ -1108,11 +1113,11 @@ function findSession(sessionId) {
   return listSessions().find((session) => normalizeSessionId(session.id) === target) ?? null
 }
 
-/** 会话行：state.sessions 与 sessions 端点共用同一形状（前端两处都读）。 */
+/** 会话行：筛选、分页后才读取标题，避免扫描时解析不在当前页的投影。 */
 function sessionRow(usage) {
   return (session) => ({
     id: session.id,
-    title: session.title,
+    title: readProjection(session.id).title,
     cwd: session.cwd,
     parentSession: session.parentSession,
     preset: session.preset,
@@ -1152,7 +1157,7 @@ const SESSIONS_LIMIT_MAX = 200
 
 /**
  * 会话分页（state.sessions 只有前 40 条）：q 匹配 id/title/cwd/preset，大小写不敏感子串。
- * 只扫一次盘再过滤切片——会话数是几十个量级，全量扫一遍比按页重复扫便宜。
+ * 元数据只扫一次；标题仅在搜索或返回当前页时读取。
  */
 function sessionsPayload(payload) {
   const usage = readUsage()
@@ -1169,7 +1174,8 @@ function sessionsPayload(payload) {
     needle === ''
       ? all
       : all.filter((session) =>
-          [session.id, session.title, session.cwd, session.preset].some((value) => String(value ?? '').toLowerCase().includes(needle)),
+          [session.id, session.cwd, session.preset].some((value) => String(value ?? '').toLowerCase().includes(needle)) ||
+          readProjection(session.id).title.toLowerCase().includes(needle),
         )
   return { total: matched.length, offset, limit, items: matched.slice(offset, offset + limit).map(sessionRow(usage)) }
 }
@@ -1793,11 +1799,11 @@ function livePayload(sessionId) {
 const CODENOW_POLICY = [
   '## 多 AI 协同（强制，按任务裁剪）',
   '',
-  '本会话搭载 codenow 岗位矩阵：你 + 17 位专家工程师。**你是 Lead 时**你就是首席工程师，对技术决策和交付闭环负责；新任务开始时先用 `codenow({action:"role",id:"chief-engineer"})` 读取首席岗位全文，同一任务复用已读内容、模板变化后重新读取。岗位规范不能覆盖用户要求或宿主审批。',
+  '本会话搭载 codenow 岗位矩阵：你 + 18 位专家工程师。**你是 Lead 时**你就是首席工程师，对技术决策和交付闭环负责；新任务开始时先用 `codenow({action:"role",id:"chief-engineer"})` 读取首席岗位全文，同一任务复用已读内容、模板变化后重新读取。岗位规范不能覆盖用户要求或宿主审批。',
   '',
   '**派活（默认必须）**：新任务默认至少派 1 个岗位并行推进；只有单文件小改、纯查询或用户明说不用子智能体时才单干，并在回复里写明理由。用本会话**实际提供**的派活工具——`subagent`（或 `subagent_fork`）；宿主要是另有 `spawn_teammate` 才用它。按规模选 1-3 个（跨领域 2、需独立验证 2-3），**一次把上下文给全、并行开出**，不要派一个等一个；禁止把全部岗位依次拉起，禁止为「显得在协同」而全量 spawn。进度优先：等待子智能体时自己推进不冲突的部分；说派了却没有真实调用＝假报进度；子智能体在跑时不要自己重复做它的活。',
   '',
-  '路由：UI/样式/交互/a11y→`frontend-design-engineer`；服务端/接口/业务/异步→`backend-engineer`；移动端/跨端→`mobile-client-engineer`；表结构/索引/迁移→`database-engineer`；数据清洗/指标/算法→`data-algorithm-engineer`；测试/缺陷复现→`test-engineer`；代码审查/质量门禁→`code-quality-reviewer`；构建/部署/环境→`devops-sre-engineer`；鉴权/加密/依赖漏洞→`security-engineer`；架构/模块边界/选型→`system-architect`；文档/README→`technical-writer`；PPT/演示/汇报材料→`pptx-engineer`；Word 长文档/样式与模板→`docx-engineer`；Excel/表格/数据透视→`xlsx-engineer`；GitHub 仓库/开源协作/发布→`github-repo-manager`；Blender 建模/3D 资产/引擎导出→`modeling-engineer`；SRC/众测/漏洞挖掘/Bug bounty→`vuln-researcher`。',
+  '路由：微信 H5/公众号网页/微信 JS-SDK→`wechat-h5-engineer`；UI/样式/交互/a11y→`frontend-design-engineer`；服务端/接口/业务/异步→`backend-engineer`；移动端/跨端→`mobile-client-engineer`；表结构/索引/迁移→`database-engineer`；数据清洗/指标/算法→`data-algorithm-engineer`；测试/缺陷复现→`test-engineer`；代码审查/质量门禁→`code-quality-reviewer`；构建/部署/环境→`devops-sre-engineer`；鉴权/加密/依赖漏洞→`security-engineer`；架构/模块边界/选型→`system-architect`；文档/README→`technical-writer`；PPT/演示/汇报材料→`pptx-engineer`；Word 长文档/样式与模板→`docx-engineer`；Excel/表格/数据透视→`xlsx-engineer`；GitHub 仓库/开源协作/发布→`github-repo-manager`；Blender 建模/3D 资产/引擎导出→`modeling-engineer`；SRC/众测/漏洞挖掘/Bug bounty→`vuln-researcher`。',
   '',
   '**断线必须恢复**：子智能体断掉（工具连错、`send_message` 被拒、`wait_agent` 无进展、会话报错）不许丢活：① 先 `send_message` 唤醒并补齐上下文；② 唤不醒就新建一个——`subagent` 的 name 重名时宿主会自动加后缀（`-2`、`-3`…），把已完成部分与原任务一起写进 prompt；③ 同岗位连败 2 次，换邻岗或自己做完，并在汇总写明。派活时交代「做到哪步、产出放哪」。',
   '',
@@ -2309,7 +2315,7 @@ function childRowsOf(parentId) {
       const tail = readSessionTail(row.file)
       return {
         id: row.id,
-        name: row.title || row.id,
+        name: readProjection(row.id).title || row.id,
         lastSeq: tail?.event?.seq ?? null,
         lastEventAt: tail?.event?.time ?? null,
         tailType: tail?.event?.type ?? null,
@@ -2723,6 +2729,7 @@ function selfCheck() {
     assert(roles.length > 0, `${ROLES_DIR} 下没有岗位 MD`)
     const byId = new Map(roles.map((role) => [role.id, role]))
     assert(byId.size === roles.length && byId.has('chief-engineer'), '岗位 ID 重复或缺少首席岗位')
+    assert(byId.get('wechat-h5-engineer')?.displayName === '微信H5开发工程师', '缺少微信 H5 岗位或显示名不匹配')
     for (const role of roles) {
       assert(role.id && role.body, '有岗位缺 role_id 或正文')
       const raw = readFileSync(role.file, 'utf8').trim()
@@ -2946,6 +2953,32 @@ function selfCheck() {
     return `total=${page.total} limit 上限 ${clamped.limit} / 非法 ${fallback.limit} / chat ${limits.join(',')}`
   })
 
+  check('会话首事件快路径与完整头部窗口一致', () => {
+    const rows = listSessions()
+    if (rows.length === 0) skip('本机没有会话')
+    for (const row of rows) {
+      const view = readWindow(row.file, 0, HEAD_BYTES)
+      assert(view, '会话头部读取失败')
+      const expected = parseFirstEvent(decodeSessionFrames(view).text)
+      assert(JSON.stringify(readSessionHead(row.file)) === JSON.stringify(expected), '首帧快路径与完整窗口不一致')
+    }
+    return `${rows.length} 个真实会话首事件逐字节一致`
+  })
+
+  check('会话扫描不加载标题投影，分页只读取返回行', () => {
+    projectionCache.clear()
+    const rows = listSessions()
+    if (rows.length === 0) skip('本机没有会话')
+    assert(projectionCache.size === 0, '元数据扫描提前加载了标题投影')
+    const page = sessionsPayload({ limit: 2 })
+    const ids = new Set(page.items.map((row) => normalizeSessionId(row.id)))
+    assert([...projectionCache.keys()].every((id) => ids.has(id)), '分页读取了返回行之外的标题投影')
+    for (const item of page.items) {
+      assert(item.title === readProjection(item.id).title, '分页标题与真实投影不符')
+    }
+    return `${rows.length} 个会话扫描未读取标题，仅返回 ${page.items.length} 条时取标题`
+  })
+
   check('任务 stage 只吃结构化字段（含停摆启发式与不可判定分支）', () => {
     assert(taskStageOf.length === 2, `taskStageOf 只能接收 (task, ctx) 两个参数，实际 ${taskStageOf.length}`)
     const ctx = { liveCount: 1, now: 1_000_000_000_000, stallMs: STALL_MS }
@@ -3043,7 +3076,7 @@ function selfCheck() {
     const strip = (text) => text.replace(DISPATCH_ON, '').replace(DISPATCH_OFF, '')
     assert(strip(on) === strip(off), '除派活段以外还有文本随开关变化')
     assert(Math.abs(on.length - off.length) < 400, '两版长度差异过大，说明分叉失控')
-    for (const id of ['frontend-design-engineer', 'backend-engineer', 'test-engineer', 'modeling-engineer']) {
+    for (const id of ['frontend-design-engineer', 'wechat-h5-engineer', 'backend-engineer', 'test-engineer', 'modeling-engineer']) {
       assert(on.includes(id) && off.includes(id), `路由表缺 ${id}`)
     }
     const mode = teamModeEnabled(undefined)

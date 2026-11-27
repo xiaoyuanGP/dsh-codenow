@@ -31,6 +31,7 @@ collaboration:
     - modeling-engineer
     - chief-engineer
     - frontend-design-engineer
+    - wechat-h5-engineer
     - backend-engineer
     - database-engineer
     - devops-sre-engineer
@@ -45,6 +46,7 @@ collaboration:
     - vuln-researcher
   can_handoff_to:
     - frontend-design-engineer
+    - wechat-h5-engineer
     - backend-engineer
     - database-engineer
     - security-engineer

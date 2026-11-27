@@ -33,6 +33,7 @@ boundaries:
 collaboration:
   can_receive_from:
     - chief-engineer
+    - wechat-h5-engineer
     - backend-engineer
     - code-quality-reviewer
     - security-engineer
@@ -45,6 +46,7 @@ collaboration:
     - backend-engineer
     - security-engineer
     - chief-engineer
+    - wechat-h5-engineer
     - mobile-client-engineer
     - technical-writer
     - pptx-engineer

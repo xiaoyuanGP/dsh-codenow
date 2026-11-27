@@ -30,12 +30,14 @@ collaboration:
   can_receive_from:
     - chief-engineer
     - frontend-design-engineer
+    - wechat-h5-engineer
     - backend-engineer
     - database-engineer
     - devops-sre-engineer
     - mobile-client-engineer
   can_handoff_to:
     - frontend-design-engineer
+    - wechat-h5-engineer
     - backend-engineer
     - database-engineer
     - code-quality-reviewer

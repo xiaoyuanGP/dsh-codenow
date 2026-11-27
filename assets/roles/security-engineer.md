@@ -35,6 +35,7 @@ collaboration:
     - code-quality-reviewer
     - backend-engineer
     - frontend-design-engineer
+    - wechat-h5-engineer
     - mobile-client-engineer
     - system-architect
     - github-repo-manager
@@ -42,6 +43,7 @@ collaboration:
   can_handoff_to:
     - backend-engineer
     - frontend-design-engineer
+    - wechat-h5-engineer
     - devops-sre-engineer
     - chief-engineer
     - technical-writer

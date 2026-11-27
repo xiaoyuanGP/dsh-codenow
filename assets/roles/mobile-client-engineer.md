@@ -40,7 +40,9 @@ collaboration:
     - chief-engineer
     - system-architect
     - frontend-design-engineer
+    - wechat-h5-engineer
   can_handoff_to:
+    - wechat-h5-engineer
     - backend-engineer
     - test-engineer
     - code-quality-reviewer

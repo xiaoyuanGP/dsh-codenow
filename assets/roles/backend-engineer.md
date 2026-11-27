@@ -34,6 +34,7 @@ collaboration:
   can_receive_from:
     - chief-engineer
     - frontend-design-engineer
+    - wechat-h5-engineer
     - database-engineer
     - code-quality-reviewer
     - data-algorithm-engineer
@@ -47,6 +48,7 @@ collaboration:
     - devops-sre-engineer
     - security-engineer
     - frontend-design-engineer
+    - wechat-h5-engineer
     - database-engineer
     - chief-engineer
     - data-algorithm-engineer
